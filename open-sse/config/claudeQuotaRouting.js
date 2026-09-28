@@ -8,7 +8,9 @@ export const QUOTA_AWARE_STRATEGY = "quota-aware";
 export const CLAUDE_QUOTA_ROUTING = {
   // Accounts at or above this 5h utilization (0-1) take no new conversations,
   // and existing ones move off them when another account still has room.
-  newSession5hMax: 0.95,
+  // 1 = drain the window fully; the 429 at the limit falls through to the
+  // next account in the same request.
+  newSession5hMax: 1,
 
   // Sticky session idle TTL. Claude requests are sent with 1h cache_control,
   // so an idle conversation keeps a warm cache for about an hour.
