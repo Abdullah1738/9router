@@ -32,6 +32,7 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import { observeClaudeHeaders } from "../services/claudeQuotaTracker.js";
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -463,6 +464,10 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     } catch (e) {
       log?.warn?.("TOKEN", `${provider.toUpperCase()} | refresh threw: ${e.message}`);
     }
+  }
+
+  if (provider === "claude" && connectionId && credentials?.authType !== "apikey") {
+    observeClaudeHeaders(connectionId, providerResponse?.headers);
   }
 
   // Provider returned error

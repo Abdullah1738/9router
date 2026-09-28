@@ -10,5 +10,11 @@ export async function register() {
 
     const { startModelCatalogSync } = await import("@/lib/modelCatalog/sync.js");
     startModelCatalogSync();
+
+    // Quota-aware Claude routing needs fresh quota state even when no
+    // dashboard page has been opened (initializeApp runs from the layout).
+    import("@/shared/services/claudeQuotaPoller")
+      .then(({ startClaudeQuotaPoller }) => startClaudeQuotaPoller())
+      .catch((e) => console.log("[ClaudeQuotaPoller] start failed:", e.message));
   }
 }

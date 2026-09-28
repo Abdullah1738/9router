@@ -22,6 +22,7 @@ import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import * as log from "../utils/logger.js";
+import { getSessionKey, getRejectionInfo } from "open-sse/services/claudeQuotaTracker.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
@@ -232,8 +233,10 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   let lastStatus = null;
   let lastHeaders = null;
 
+  const sessionKey = getSessionKey(clientRawRequest?.headers, body);
+
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
+    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { sessionKey });
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
@@ -314,6 +317,11 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     // Antigravity 409/429: refresh live quota to get exact resetAt before locking
     let quotaResetMs = null;
     let resetsAtMs = result.resetsAtMs;
+    // Claude 429: the unified rate-limit headers on the error tell us which
+    // window ran out and when it resets.
+    if (provider === "claude" && result.status === HTTP_STATUS.RATE_LIMITED && !resetsAtMs) {
+      resetsAtMs = getRejectionInfo(credentials.connectionId).resetsAtMs;
+    }
     if (provider === "antigravity" && (result.status === 409 || result.status === 429)) {
       quotaResetMs = await handleAntigravityQuotaError(
         credentials.connectionId, result.status, model,

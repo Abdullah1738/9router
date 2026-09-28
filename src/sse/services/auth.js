@@ -2,6 +2,8 @@ import { getProviderConnections, validateApiKey, updateProviderConnection, getSe
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
+import { QUOTA_AWARE_STRATEGY } from "open-sse/config/claudeQuotaRouting.js";
+import { getQuotaLockUntil, getRejectionInfo, selectQuotaAware } from "open-sse/services/claudeQuotaTracker.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache } from "./antigravityQuota.js";
 import * as log from "../utils/logger.js";
@@ -31,6 +33,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     ? excludeConnectionIds
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
+  const sessionKey = options?.sessionKey || null;
   // Acquire mutex to prevent race conditions
   const currentMutex = selectionMutex;
   let resolveMutex;
@@ -79,12 +82,17 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
 
     // Antigravity quota cache is lazy: only populated after that account returns 409/429.
     const isAntigravity = providerId === "antigravity";
+    // Claude OAuth quota is account-wide; the tracker knows 5h/7d exhaustion
+    // from response headers and the usage poller.
+    const isClaude = providerId === "claude";
+    const quotaLockUntil = (c) => (isClaude && c.authType === "oauth" ? getQuotaLockUntil(c.id) : 0);
     const antigravityQuotaCache = isAntigravity && model ? getAntigravityQuotaCache() : null;
 
     // Filter out model-locked, excluded, and Antigravity quota-exhausted connections.
     const availableConnections = connections.filter(c => {
       if (excludeSet.has(c.id)) return false;
       if (isModelLockActive(c, model)) return false;
+      if (quotaLockUntil(c)) return false;
       // Antigravity: skip if live quota exhausted for this model
       if (isAntigravity && model && antigravityQuotaCache) {
         const quota = antigravityQuotaCache.get(c.id)?.[model];
@@ -109,8 +117,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
 
     if (availableConnections.length === 0) {
       // Find earliest persistent lock or lazy Antigravity quota-cache reset for retry timing.
-      const lockedConns = connections.filter(c => isModelLockActive(c, model));
-      const expiries = lockedConns.map(c => getEarliestModelLockUntil(c)).filter(Boolean);
+      const lockedConns = connections.filter(c => isModelLockActive(c, model) || quotaLockUntil(c));
+      const expiries = lockedConns.map(c => {
+        const q = quotaLockUntil(c);
+        return q ? new Date(q).toISOString() : getEarliestModelLockUntil(c);
+      }).filter(Boolean);
       if (isAntigravity && model && antigravityQuotaCache) {
         connections.forEach((c) => {
           const resetAt = antigravityQuotaCache.get(c.id)?.[model]?.resetAt;
@@ -136,7 +147,10 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const settings = await getSettings();
     // Per-provider strategy overrides global setting
     const providerOverride = (settings.providerStrategies || {})[providerId] || {};
-    const strategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
+    // Claude defaults to quota-aware unless the provider has its own override.
+    const strategy = providerOverride.fallbackStrategy
+      || (isClaude ? QUOTA_AWARE_STRATEGY : null)
+      || settings.fallbackStrategy || "fill-first";
 
     let connection;
     // Pin to preferred connection if specified and available
@@ -148,6 +162,15 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     }
     if (connection) {
       // skip strategy
+    } else if (strategy === QUOTA_AWARE_STRATEGY && isClaude) {
+      // Quota tracking only exists for OAuth (subscription) accounts. API-key
+      // connections are pay-per-token and only used when no OAuth account is left.
+      const oauthConnections = availableConnections.filter(c => c.authType === "oauth");
+      const pick = oauthConnections.length
+        ? selectQuotaAware(oauthConnections, sessionKey)
+        : { connection: availableConnections[0], reason: "no-oauth" };
+      connection = pick.connection || availableConnections[0];
+      log.info("AUTH", `${provider} | quota-aware -> ${connection.displayName || connection.name || connection.email || connection.id?.slice(0, 8)} (${pick.reason}${sessionKey ? "" : ", no session key"})`);
     } else if (strategy === "round-robin") {
       const stickyLimit = providerOverride.stickyRoundRobinLimit || settings.stickyRoundRobinLimit || 3;
 
@@ -254,6 +277,9 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   } else if (resetsAtMs && resetsAtMs > Date.now()) {
     shouldFallback = true;
     // Antigravity quota API provides exact per-model resetAt. Do not truncate it.
+    // Claude keeps the 30 min cap here on purpose: the quota tracker enforces
+    // the real 5h/weekly reset and lifts it as soon as a poll shows quota back
+    // (e.g. after a reset grant), while a days-long DB lock would not.
     cooldownMs = resolveProviderId(provider) === "antigravity"
       ? resetsAtMs - Date.now()
       : Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
@@ -264,7 +290,12 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
   const reason = typeof errorText === "string" ? errorText.slice(0, 200) : "Provider error";
-  const lockUpdate = buildModelLockUpdate(githubResetAtMs ? null : model, cooldownMs);
+  // Claude subscription quota is account-wide, not per model.
+  // Model-scoped weekly caps (representative claim not five_hour/seven_day) only lock that model.
+  const accountWide = githubResetAtMs
+    || (resolveProviderId(provider) === "claude" && status === 429 && resetsAtMs
+      && getRejectionInfo(connectionId).accountWide);
+  const lockUpdate = buildModelLockUpdate(accountWide ? null : model, cooldownMs);
 
   await updateProviderConnection(connectionId, {
     ...lockUpdate,

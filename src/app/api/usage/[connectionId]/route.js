@@ -1,5 +1,6 @@
 // Ensure proxyFetch is loaded to patch globalThis.fetch
 import "open-sse/index.js";
+import { ingestClaudeUsage } from "open-sse/services/claudeQuotaTracker.js";
 
 import { getProviderConnectionById, updateProviderConnection } from "@/lib/localDb";
 import { getUsageForProvider } from "open-sse/services/usage.js";
@@ -183,6 +184,11 @@ export async function GET(request, { params }) {
       }
     }
 
+    // Dashboard refresh also refreshes the quota-aware router's view. Only on
+    // force: non-forced reads may be cached and older than header data.
+    if (force && connection.provider === "claude" && connection.authType === "oauth") {
+      ingestClaudeUsage(connection.id, usage);
+    }
     return Response.json(usage);
   } catch (error) {
     const provider = connection?.provider ?? "unknown";

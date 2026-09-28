@@ -1,8 +1,11 @@
 // Ensure proxyFetch is loaded to patch globalThis.fetch
 import "open-sse/index.js";
 
-import { getProviderConnectionById } from "@/lib/localDb";
+import { getProviderConnectionById, updateProviderConnection } from "@/lib/localDb";
+import { buildClearModelLocksUpdate } from "open-sse/services/accountFallback.js";
 import { consumeClaudeResetGrant } from "open-sse/services/usage.js";
+import { getClaudeUsage } from "open-sse/services/usage/claude.js";
+import { ingestClaudeUsage } from "open-sse/services/claudeQuotaTracker.js";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { refreshAndUpdateCredentials } from "../route.js";
 
@@ -30,7 +33,16 @@ export async function POST(request, { params }) {
     ({ connection } = await refreshAndUpdateCredentials(connection, false, proxyOptions));
     const result = await consumeClaudeResetGrant(connection.accessToken, grantId, proxyOptions);
 
-    if (result.ok) return Response.json(result);
+    if (result.ok) {
+      // Put the account back into quota-aware routing right away.
+      try {
+        await updateProviderConnection(connection.id, {
+          ...buildClearModelLocksUpdate(connection), testStatus: "active", lastError: null, errorCode: null, backoffLevel: 0,
+        });
+        ingestClaudeUsage(connection.id, await getClaudeUsage(connection.accessToken, proxyOptions, { force: true }));
+      } catch {}
+      return Response.json(result);
+    }
     const status = result.status >= 400 && result.status < 500 ? result.status : 409;
     return Response.json({ ...result, message: result.message || `Reset not applied: ${result.reason || result.result || "unknown"}` }, { status });
   } catch (error) {
