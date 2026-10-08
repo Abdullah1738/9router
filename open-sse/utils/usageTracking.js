@@ -108,7 +108,23 @@ export function filterUsageForFormat(usage, targetFormat) {
     fields = formatFields.default;
   }
 
-  return pickFields(fields);
+  const filtered = pickFields(fields);
+
+  // OpenAI clients read cache hits only from prompt_tokens_details. Claude-shaped
+  // internal usage carries them as cache_read/cache_creation_input_tokens, which
+  // the field pick above drops, so carry them over into the details object.
+  if (fields === formatFields.default) {
+    const cacheRead = Number(usage.cache_read_input_tokens ?? usage.cached_tokens) || 0;
+    const cacheCreation = Number(usage.cache_creation_input_tokens) || 0;
+    if (cacheRead > 0 || cacheCreation > 0) {
+      const details = { ...(filtered.prompt_tokens_details || {}) };
+      if (cacheRead > 0 && details.cached_tokens === undefined) details.cached_tokens = cacheRead;
+      if (cacheCreation > 0 && details.cache_creation_tokens === undefined) details.cache_creation_tokens = cacheCreation;
+      filtered.prompt_tokens_details = details;
+    }
+  }
+
+  return filtered;
 }
 
 /**
