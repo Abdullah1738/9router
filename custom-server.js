@@ -14,6 +14,70 @@ const PEER_TOKEN = crypto.randomBytes(24).toString("hex");
 process.env.NINEROUTER_PEER_TOKEN = PEER_TOKEN;
 
 let backgroundRefreshStarted = false;
+let backgroundRefreshStop = null;
+
+// ── Graceful drain (only under scripts/cluster-supervisor.cjs) ──────────────
+// The supervisor owns the listen socket. On reload it forks a worker from the
+// new release, waits for it to answer /api/health itself, then sends
+// {type:"9r:drain"} here: stop taking connections, finish in-flight requests
+// (long LLM streams included), then exit. Background jobs stop at drain start
+// so two workers never refresh the same OAuth token at once.
+const cluster = require("cluster");
+const activeResponses = new Set();
+const LONG_LIVED_DASHBOARD_STREAMS = ["/api/usage/stream", "/api/translator/console-logs/stream"];
+let drainableServer = null;
+let draining = false;
+
+function trackRequest(req, res) {
+  res.setHeader("x-9r-worker", String(process.pid));
+  if (draining) res.shouldKeepAlive = false;
+  activeResponses.add(res);
+  res.once("close", () => {
+    activeResponses.delete(res);
+    if (draining) maybeExitAfterDrain();
+  });
+}
+
+function exitAfterDrain(reason) {
+  console.log(`[9r-worker ${process.pid}] drain finished (${reason}), exiting`);
+  // App SIGTERM handlers close SQLite and flush buffered request details.
+  process.kill(process.pid, "SIGTERM");
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+
+function maybeExitAfterDrain() {
+  if (activeResponses.size === 0) exitAfterDrain("idle");
+}
+
+function startDrain(maxMs) {
+  if (draining) return;
+  draining = true;
+  globalThis.__9rDraining = true;
+  console.log(`[9r-worker ${process.pid}] draining, ${activeResponses.size} in flight`);
+  try {
+    backgroundRefreshStop?.();
+  } catch {
+    /* ignore */
+  }
+  for (const res of activeResponses) {
+    // Dashboard event streams never end on their own; their EventSource reconnects.
+    if (LONG_LIVED_DASHBOARD_STREAMS.some((p) => (res.req?.url || "").startsWith(p))) res.req.socket.destroy();
+    else if (!res.headersSent) res.shouldKeepAlive = false;
+  }
+  if (drainableServer) {
+    drainableServer.close();
+    drainableServer.closeIdleConnections?.();
+    setInterval(() => drainableServer.closeIdleConnections?.(), 1000).unref();
+  }
+  setTimeout(() => exitAfterDrain(`max drain ${maxMs}ms`), maxMs).unref();
+  maybeExitAfterDrain();
+}
+
+if (cluster.isWorker) {
+  process.on("message", (msg) => {
+    if (msg && msg.type === "9r:drain") startDrain(Number(msg.maxMs) || 20 * 60 * 1000);
+  });
+}
 
 function startBackgroundTokenRefreshFromCustomServer() {
   if (backgroundRefreshStarted) return;
@@ -35,6 +99,7 @@ function startBackgroundTokenRefreshFromCustomServer() {
           /* ignore */
         }
       };
+      backgroundRefreshStop = stop;
       process.once("SIGINT", stop);
       process.once("SIGTERM", stop);
     })
@@ -72,9 +137,14 @@ http.createServer = (...args) => {
     if (viaProxy) req.headers["x-9r-via-proxy"] = "1";
     return handler(req, res);
   };
-  const server = origCreate(...rest, wrapped);
+  const wrappedForDrain = (req, res) => {
+    if (cluster.isWorker) trackRequest(req, res);
+    return wrapped(req, res);
+  };
+  const server = origCreate(...rest, wrappedForDrain);
   server.once("listening", () => {
     startBackgroundTokenRefreshFromCustomServer();
+    if (cluster.isWorker && !drainableServer) drainableServer = server;
   });
   const origEmit = server.emit;
   // JBR 25 sends h2c upgrades that the HTTP/1.1 server would otherwise close.

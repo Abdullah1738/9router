@@ -184,7 +184,7 @@ async function collectEntries() {
 
 // Run one sync. Returns a summary, or null when it could not complete.
 export async function syncModelCatalog() {
-  if (state.running) return null;
+  if (state.running || globalThis.__9rDraining) return null;
   state.running = true;
   try {
     const headers = { accept: "application/json" };

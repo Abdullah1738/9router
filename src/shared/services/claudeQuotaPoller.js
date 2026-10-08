@@ -64,7 +64,7 @@ export async function pollClaudeConnection(connectionId, { force = true } = {}) 
 }
 
 async function tick() {
-  if (g.running) return;
+  if (g.running || globalThis.__9rDraining) return;
   g.running = true;
   try {
     const now = Date.now();

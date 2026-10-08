@@ -259,7 +259,7 @@ function createDefaultDeps() {
 }
 
 export async function runQuotaAutoPingTick(deps = createDefaultDeps(), state = g) {
-  if (state.running) return;
+  if (state.running || globalThis.__9rDraining) return;
   state.running = true;
   try {
     const settings = await deps.getSettings();

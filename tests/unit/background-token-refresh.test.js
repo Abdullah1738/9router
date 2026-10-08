@@ -138,6 +138,24 @@ describe("runBackgroundTokenRefreshTick", () => {
     expect(refreshConnection.mock.calls[0][0].id).toBe("due");
   });
 
+  it("skips the tick while the worker is draining for a reload", async () => {
+    const loadConnections = vi.fn(async () => [conn()]);
+    const refreshConnection = vi.fn();
+    const { runBackgroundTokenRefreshTick } = await import(
+      "../../src/sse/services/backgroundTokenRefresh.js"
+    );
+
+    globalThis.__9rDraining = true;
+    try {
+      await runBackgroundTokenRefreshTick({ loadConnections, refreshConnection });
+    } finally {
+      delete globalThis.__9rDraining;
+    }
+
+    expect(loadConnections).not.toHaveBeenCalled();
+    expect(refreshConnection).not.toHaveBeenCalled();
+  });
+
   it("does not call refresh when nothing is due", async () => {
     const refreshConnection = vi.fn();
     const loadConnections = vi.fn(async () => [

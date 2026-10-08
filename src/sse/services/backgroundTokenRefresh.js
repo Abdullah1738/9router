@@ -88,7 +88,8 @@ async function refreshOne(connection) {
  * @param {{ loadConnections?: Function, refreshConnection?: Function }} [deps]
  */
 export async function runBackgroundTokenRefreshTick(deps = {}) {
-  if (tickRunning) return;
+  // A draining worker leaves token refresh to its replacement (custom-server.js).
+  if (tickRunning || globalThis.__9rDraining) return;
   tickRunning = true;
   try {
     const load = deps.loadConnections || loadActiveConnections;
