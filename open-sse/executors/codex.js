@@ -142,6 +142,11 @@ function resolveCacheSessionId(body, credentials) {
   });
 }
 
+// Upstream model id -> the only reasoning effort it may run at.
+export const FORCED_REASONING_EFFORT = Object.freeze({
+  "gpt-6-astra": "xhigh",
+});
+
 function normalizeReasoningEffort(model, value) {
   const supportedLevels = getThinkingLevels("codex", model);
   if (supportedLevels?.includes(value)) return value;
@@ -521,6 +526,12 @@ export class CodexExecutor extends BaseExecutor {
     } else {
       body.reasoning.effort = normalizeReasoningEffort(body.model, body.reasoning.effort);
       if (!responsesLite && !body.reasoning.summary) body.reasoning.summary = "auto";
+    }
+    // Owner policy: some models always run at one fixed effort, whatever the client asked for.
+    const forcedEffort = FORCED_REASONING_EFFORT[body.model];
+    if (forcedEffort && body.reasoning.effort !== forcedEffort) {
+      dbg("CODEX", `reasoning effort ${body.reasoning.effort} -> ${forcedEffort} (forced for ${body.model})`);
+      body.reasoning.effort = forcedEffort;
     }
     if (responsesLite) body.reasoning.context = "all_turns";
     delete body.reasoning_effort;
