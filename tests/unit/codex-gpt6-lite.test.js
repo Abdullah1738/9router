@@ -183,6 +183,85 @@ describe("Codex GPT-6 Sol/Luna transport", () => {
     expect(body.reasoning).toEqual({ effort: "max", context: "all_turns" });
   });
 
+  it("sends GPT-6.1 Sol as regular Responses with parallel tool calls", async () => {
+    const fetchMock = vi.spyOn(proxyFetchModule, "proxyAwareFetch").mockResolvedValue({
+      ok: true, status: 200, headers: new Map(),
+    });
+    const tool = { type: "function", name: "run", parameters: { type: "object", properties: {} } };
+    await new CodexExecutor().execute({
+      model: "gpt-6.1-sol",
+      body: { model: "gpt-6.1-sol", input: "hello", instructions: "Do the task", tools: [tool], reasoning_effort: "xhigh" },
+      stream: true,
+      credentials,
+    });
+
+    const [, options] = fetchMock.mock.calls[0];
+    const body = JSON.parse(options.body);
+    expect(options.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
+    expect(body.parallel_tool_calls).toBe(true);
+    expect(body.instructions).toBe("Do the task");
+    expect(body.tools).toEqual([tool]);
+    expect(body.input.some(item => item.type === "additional_tools")).toBe(false);
+    expect(body.reasoning).toEqual({ effort: "xhigh", context: "all_turns" });
+  });
+
+  it("moves a native Lite prefix out for GPT-6.1 Sol", () => {
+    const executor = new CodexExecutor();
+    const tool = { type: "function", name: "run", parameters: { type: "object", properties: {} } };
+    const body = executor.transformRequest("gpt-6.1-sol", {
+      model: "gpt-6.1-sol", input: [
+        { type: "additional_tools", role: "developer", tools: [tool] },
+        { type: "message", role: "developer", content: [{ type: "input_text", text: "Native instructions" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+      ], instructions: "", tools: null, parallel_tool_calls: false,
+    }, true, credentials);
+
+    expect(body.tools).toEqual([tool]);
+    expect(body.parallel_tool_calls).toBe(true);
+    expect(body.instructions).toBe("");
+    expect(body.input.some(item => item.type === "additional_tools")).toBe(false);
+    expect(body.input[0].content[0].text).toBe("Native instructions");
+    expect(executor.buildHeaders(credentials, true, null, "gpt-6.1-sol", body)["x-openai-internal-codex-responses-lite"]).toBeUndefined();
+  });
+
+  it("does not add default instructions when a converted GPT-6.1 Sol body is retried", () => {
+    const executor = new CodexExecutor();
+    const tool = { type: "function", name: "run", parameters: { type: "object", properties: {} } };
+    const body = {
+      model: "gpt-6.1-sol", input: [
+        { type: "additional_tools", role: "developer", tools: [tool] },
+        { type: "message", role: "developer", content: [{ type: "input_text", text: "Native instructions" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+      ], instructions: "", tools: null,
+    };
+    executor.transformRequest("gpt-6.1-sol", body, true, credentials);
+    const retried = executor.transformRequest("gpt-6.1-sol", body, true, credentials);
+
+    expect(retried.instructions).toBe("");
+    expect(retried.tools).toEqual([tool]);
+    expect(retried.parallel_tool_calls).toBe(true);
+  });
+
+  it("omits parallel_tool_calls on GPT-6.1 Sol requests without tools", () => {
+    const executor = new CodexExecutor();
+    const body = executor.transformRequest("gpt-6.1-sol", {
+      model: "gpt-6.1-sol", input: "Title this chat", instructions: "Write a title",
+    }, true, credentials);
+
+    expect(body.parallel_tool_calls).toBeUndefined();
+    expect(body.instructions).toBe("Write a title");
+    expect(executor.buildHeaders(credentials, true, null, "gpt-6.1-sol(xhigh)", body)["x-openai-internal-codex-responses-lite"]).toBeUndefined();
+  });
+
+  it.each(["gpt-5.5", "gpt-6-astra"])("leaves parallel_tool_calls unset for %s", (model) => {
+    const tool = { type: "function", name: "run", parameters: { type: "object", properties: {} } };
+    const body = new CodexExecutor().transformRequest(model, {
+      model, input: "hello", tools: [tool], parallel_tool_calls: true,
+    }, true, credentials);
+
+    expect(body.parallel_tool_calls).toBeUndefined();
+  });
+
   it("sends the Lite shape and header in the actual outbound request", async () => {
     const fetchMock = vi.spyOn(proxyFetchModule, "proxyAwareFetch").mockResolvedValue({
       ok: true, status: 200, headers: new Map(),

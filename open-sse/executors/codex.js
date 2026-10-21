@@ -29,6 +29,15 @@ function isCodexResponsesLiteModel(model) {
   const baseId = String(model || "").replace(/\([^()]+\)\s*$/, "");
   return getProviderModels("cx").some((entry) => entry.id === baseId && entry.responsesLite === true);
 }
+// The backend rejects parallel_tool_calls=true on the Lite transport, so Lite
+// models flagged parallelToolCalls go out as regular Responses instead.
+function prefersCodexParallelToolCalls(model) {
+  const baseId = String(model || "").replace(/\([^()]+\)\s*$/, "");
+  return getProviderModels("cx").some((entry) => entry.id === baseId && entry.responsesLite === true && entry.parallelToolCalls === true);
+}
+// Bodies whose Lite prefix was already moved out. Retries re-run transformRequest on
+// the same mutated body, which no longer shows the prefix it came from.
+const LITE_PREFIX_CONVERTED = new WeakSet();
 
 // Server-generated item id prefixes that Codex /responses cannot resolve when store=false
 const SERVER_ID_PATTERN = /^(rs|fc|resp|msg)_/;
@@ -224,7 +233,9 @@ export class CodexExecutor extends BaseExecutor {
    */
   buildHeaders(credentials, stream = true, _url = null, model = null, body = null) {
     const headers = super.buildHeaders(credentials, stream);
-    if (isCodexResponsesLiteModel(model && getModelUpstreamId("cx", model)) && !body?.tools?.some?.(tool => tool?.type === "web_search")) {
+    const upstreamModel = model && getModelUpstreamId("cx", model);
+    if (isCodexResponsesLiteModel(upstreamModel) && !prefersCodexParallelToolCalls(upstreamModel)
+      && !body?.tools?.some?.(tool => tool?.type === "web_search")) {
       headers["x-openai-internal-codex-responses-lite"] = "true";
     }
     headers["session_id"] = this._currentSessionId || credentials?.connectionId || "default";
@@ -431,11 +442,12 @@ export class CodexExecutor extends BaseExecutor {
     if (autoWebSearch && !body.tools?.some?.(tool => tool?.type === "web_search")) {
       body.tools = [...(Array.isArray(body.tools) ? body.tools : []), { type: "web_search" }];
     }
-    // Hosted search cannot run from a Lite input prefix. When switching to
-    // regular Responses, move all prefixed tools without duplicating definitions.
+    // Hosted search and parallel tool calls cannot run from a Lite input prefix. When
+    // switching to regular Responses, move all prefixed tools without duplicating definitions.
+    const parallelTools = prefersCodexParallelToolCalls(upstreamModel);
     let convertedLitePrefix = false;
     if (isCodexResponsesLiteModel(upstreamModel) && Array.isArray(body.input)
-      && (body.tools?.some?.(tool => tool?.type === "web_search")
+      && (parallelTools || body.tools?.some?.(tool => tool?.type === "web_search")
         || body.input.some(item => item?.type === "additional_tools" && item.tools?.some?.(tool => tool?.type === "web_search")))) {
       const tools = Array.isArray(body.tools) ? [...body.tools] : [];
       const seen = new Set(tools.map(tool => `${tool?.type}:${tool?.name || tool?.function?.name || ""}`));
@@ -450,8 +462,12 @@ export class CodexExecutor extends BaseExecutor {
       convertedLitePrefix = body.input.some(item => item?.type === "additional_tools");
       body.input = body.input.filter(item => item?.type !== "additional_tools");
     }
-    const responsesLite = isCodexResponsesLiteModel(upstreamModel)
+    if (convertedLitePrefix) LITE_PREFIX_CONVERTED.add(body);
+    else convertedLitePrefix = LITE_PREFIX_CONVERTED.has(body);
+    const responsesLite = isCodexResponsesLiteModel(upstreamModel) && !parallelTools
       && !body.tools?.some?.(tool => tool?.type === "web_search");
+    // Parallel-tool Lite models keep the Lite reasoning shape on the regular transport.
+    const liteReasoning = responsesLite || parallelTools;
 
     // Ensure input is present and non-empty (Codex API rejects empty input)
     if (!body.input || (Array.isArray(body.input) && body.input.length === 0)) {
@@ -502,6 +518,8 @@ export class CodexExecutor extends BaseExecutor {
       body.tools = null;
       body.tool_choice ||= "auto";
       body.parallel_tool_calls = false;
+    } else if (parallelTools && Array.isArray(body.tools) && body.tools.length > 0) {
+      body.parallel_tool_calls = true;
     } else {
       delete body.parallel_tool_calls;
     }
@@ -521,11 +539,11 @@ export class CodexExecutor extends BaseExecutor {
 
     // Priority: explicit reasoning.effort > reasoning_effort param > model suffix > default (medium)
     if (!body.reasoning) {
-      const effort = normalizeReasoningEffort(body.model, body.reasoning_effort || modelEffort || (responsesLite ? 'medium' : 'low'));
-      body.reasoning = responsesLite ? { effort } : { effort, summary: "auto" };
+      const effort = normalizeReasoningEffort(body.model, body.reasoning_effort || modelEffort || (liteReasoning ? 'medium' : 'low'));
+      body.reasoning = liteReasoning ? { effort } : { effort, summary: "auto" };
     } else {
       body.reasoning.effort = normalizeReasoningEffort(body.model, body.reasoning.effort);
-      if (!responsesLite && !body.reasoning.summary) body.reasoning.summary = "auto";
+      if (!liteReasoning && !body.reasoning.summary) body.reasoning.summary = "auto";
     }
     // Owner policy: some models always run at one fixed effort, whatever the client asked for.
     const forcedEffort = FORCED_REASONING_EFFORT[body.model];
@@ -533,7 +551,7 @@ export class CodexExecutor extends BaseExecutor {
       dbg("CODEX", `reasoning effort ${body.reasoning.effort} -> ${forcedEffort} (forced for ${body.model})`);
       body.reasoning.effort = forcedEffort;
     }
-    if (responsesLite) body.reasoning.context = "all_turns";
+    if (liteReasoning) body.reasoning.context = "all_turns";
     delete body.reasoning_effort;
 
     // Include reasoning encrypted content (required by Codex backend for reasoning models)
