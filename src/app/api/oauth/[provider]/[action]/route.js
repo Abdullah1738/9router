@@ -7,7 +7,7 @@ import {
   requestDeviceCode,
   pollForToken
 } from "@/lib/oauth/providers";
-import { createProviderConnection } from "@/models";
+import { createProviderConnection, getProviderConnectionById, updateProviderConnection } from "@/models";
 import { readDesktopPassToken } from "open-sse/shared/mimoAccount.js";
 import {
   startCodexProxy,
@@ -291,6 +291,39 @@ export async function GET(request, { params }) {
   }
 }
 
+// Re-login of an account whose refresh token died: put the new tokens on the
+// same row so it keeps its name, priority and settings and goes back into
+// rotation, instead of adding a duplicate next to the dead one.
+async function saveReauthTokens(provider, connectionId, tokens, expiresAt) {
+  const existing = await getProviderConnectionById(connectionId);
+  if (!existing || existing.provider !== provider || existing.authType !== "oauth") return null;
+  return updateProviderConnection(connectionId, {
+    ...tokens,
+    ...(tokens.providerSpecificData
+      ? { providerSpecificData: { ...existing.providerSpecificData, ...tokens.providerSpecificData } }
+      : {}),
+    expiresAt,
+    lastRefreshAt: new Date().toISOString(),
+    testStatus: "active",
+    reauthRequiredAt: null,
+  });
+}
+
+function reauthResponse(connection) {
+  if (!connection) {
+    return NextResponse.json({ error: "Connection to log in again was not found" }, { status: 404 });
+  }
+  return NextResponse.json({
+    success: true,
+    connection: {
+      id: connection.id,
+      provider: connection.provider,
+      email: connection.email,
+      displayName: connection.displayName,
+    },
+  });
+}
+
 // POST /api/oauth/[provider]/exchange - Exchange code for tokens and save
 // POST /api/oauth/[provider]/poll - Poll for token (device_code flow)
 export async function POST(request, { params }) {
@@ -318,7 +351,7 @@ export async function POST(request, { params }) {
     }
 
     if (action === "exchange") {
-      const { code, redirectUri, codeVerifier, state, meta, systemId } = body;
+      const { code, redirectUri, codeVerifier, state, meta, systemId, reauthConnectionId } = body;
 
       // Xiaomi MiMo: no token exchange needed — the callback already decrypted the sk.
       // Just read the session result and create the connection.
@@ -470,14 +503,20 @@ export async function POST(request, { params }) {
         ...(systemId ? { systemId } : {}),
       });
 
+      const expiresAt = tokenData.expiresIn
+        ? new Date(Date.now() + tokenData.expiresIn * 1000).toISOString()
+        : null;
+
+      if (reauthConnectionId) {
+        return reauthResponse(await saveReauthTokens(provider, reauthConnectionId, tokenData, expiresAt));
+      }
+
       // Save to database
       const connection = await createProviderConnection({
         provider,
         authType: "oauth",
         ...tokenData,
-        expiresAt: tokenData.expiresIn 
-          ? new Date(Date.now() + tokenData.expiresIn * 1000).toISOString() 
-          : null,
+        expiresAt,
         testStatus: "active",
       });
 
@@ -493,7 +532,7 @@ export async function POST(request, { params }) {
     }
 
     if (action === "poll") {
-      const { deviceCode, codeVerifier, extraData } = body;
+      const { deviceCode, codeVerifier, extraData, reauthConnectionId } = body;
 
       if (!deviceCode) {
         return NextResponse.json({ error: "Missing device code" }, { status: 400 });
@@ -527,13 +566,17 @@ export async function POST(request, { params }) {
       if (result.success) {
         // Save to database (legacy kimi-coding OAuth → dual-auth kimi)
         const providerId = provider === "kimi-coding" ? "kimi" : provider;
+        const expiresAt = result.tokens.expiresIn
+          ? new Date(Date.now() + result.tokens.expiresIn * 1000).toISOString()
+          : null;
+        if (reauthConnectionId) {
+          return reauthResponse(await saveReauthTokens(providerId, reauthConnectionId, result.tokens, expiresAt));
+        }
         const connection = await createProviderConnection({
           provider: providerId,
           authType: "oauth",
           ...result.tokens,
-          expiresAt: result.tokens.expiresIn 
-            ? new Date(Date.now() + result.tokens.expiresIn * 1000).toISOString() 
-            : null,
+          expiresAt,
           testStatus: "active",
         });
 

@@ -20,8 +20,13 @@ export async function GET() {
     activeSessions: snapshot.activeSessionsPerAccount?.[a.connectionId] || 0,
     nextPollAt: poller.nextPollAt?.[a.connectionId] || null,
   }));
+  // Accounts whose refresh token was rejected: out of rotation until someone
+  // logs them in again from the provider page.
+  const needsRelogin = connections
+    .filter((c) => c.isActive !== false && c.reauthRequiredAt)
+    .map((c) => ({ connectionId: c.id, name: names[c.id], since: c.reauthRequiredAt }));
   return NextResponse.json(
-    { now, accounts, sessionCount: snapshot.sessionCount },
+    { now, accounts, sessionCount: snapshot.sessionCount, needsRelogin },
     { headers: { "Cache-Control": "no-store" } }
   );
 }

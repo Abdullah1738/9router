@@ -35,7 +35,7 @@ const PASTE_TOKEN_PROVIDERS = {
  * - Localhost: Auto callback via popup message
  * - Remote: Manual paste callback URL
  */
-export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, onClose, oauthMeta, idcConfig }) {
+export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, onClose, oauthMeta, idcConfig, reauthConnectionId }) {
   const [step, setStep] = useState("waiting"); // waiting | input | success | error
   const [authData, setAuthData] = useState(null);
   const [callbackUrl, setCallbackUrl] = useState("");
@@ -98,6 +98,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
           // connection keeps the id sent to zed.dev (see register-session).
           ...(authData.systemId ? { systemId: authData.systemId } : {}),
           ...(oauthMeta ? { meta: oauthMeta } : {}),
+          ...(reauthConnectionId ? { reauthConnectionId } : {}),
         }),
       });
 
@@ -110,7 +111,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
       setError(err.message);
       setStep("error");
     }
-  }, [authData, provider, oauthMeta]);
+  }, [authData, provider, oauthMeta, reauthConnectionId]);
 
   const completeXaiManualCode = useCallback(async (code) => {
     if (!authData?.state) return;
@@ -162,7 +163,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
         const res = await fetch(`/api/oauth/${provider}/poll`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ deviceCode, codeVerifier, extraData }),
+          body: JSON.stringify({ deviceCode, codeVerifier, extraData, ...(reauthConnectionId ? { reauthConnectionId } : {}) }),
         });
 
         const data = await res.json();
@@ -193,7 +194,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
     setError("Authorization timeout");
     setStep("error");
     setPolling(false);
-  }, [provider]);
+  }, [provider, reauthConnectionId]);
 
   // Stop the proxy owned by THIS modal session, at most once. Re-renders,
   // repeated closes, and post-completion calls are all no-ops by construction.
@@ -1004,6 +1005,8 @@ OAuthModal.propTypes = {
   onClose: PropTypes.func.isRequired,
   /** Extra metadata passed to /authorize and /exchange (e.g. gitlab clientId/baseUrl) */
   oauthMeta: PropTypes.object,
+  /** Existing connection to put the new tokens on (re-login after a dead refresh token) */
+  reauthConnectionId: PropTypes.string,
   /** Optional Kiro IDC config for AWS IAM Identity Center device flow */
   idcConfig: PropTypes.shape({
     startUrl: PropTypes.string,

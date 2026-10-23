@@ -27,6 +27,11 @@ import CustomConfigCard from "./CustomConfigCard";
 
 const ONE_BY_ONE_DELAY_MS = 1000;
 
+// Re-login only works where the generic OAuth modal posts the tokens back through
+// /exchange or /poll. These providers log in through their own modal, a server-side
+// proxy or an import, which always saves a new row.
+const RELOGIN_UNSUPPORTED = new Set(["kiro", "cursor", "zed", "gitlab", "xiaomi-mimo", "codex", "xai", "trae", "windsurf"]);
+
 const AUTO_PING_SETTINGS_KEYS = {
   claude: "claudeAutoPing",
   codex: "codexAutoPing",
@@ -46,6 +51,7 @@ export default function ProviderDetailPage() {
   const [providerNode, setProviderNode] = useState(null);
   const [proxyPools, setProxyPools] = useState([]);
   const [showOAuthModal, setShowOAuthModal] = useState(false);
+  const [reauthConnectionId, setReauthConnectionId] = useState(null);
   const [showXiaomiMimoModal, setShowXiaomiMimoModal] = useState(false);
   const [showIFlowCookieModal, setShowIFlowCookieModal] = useState(false);
   const [showAddApiKeyModal, setShowAddApiKeyModal] = useState(false);
@@ -91,7 +97,18 @@ export default function ProviderDetailPage() {
   const AG_RISK_STORAGE_KEY = "ag_risk_confirmed";
 
   const openOAuthConnection = () => {
+    setReauthConnectionId(null);
     setShowOAuthModal(true);
+  };
+
+  const openRelogin = (connectionId) => {
+    setReauthConnectionId(connectionId);
+    setShowOAuthModal(true);
+  };
+
+  const closeOAuthModal = () => {
+    setShowOAuthModal(false);
+    setReauthConnectionId(null);
   };
 
   const triggerOAuthConnection = () => {
@@ -153,6 +170,7 @@ export default function ProviderDetailPage() {
     : (OAUTH_PROVIDERS[providerId] || APIKEY_PROVIDERS[providerId] || FREE_PROVIDERS[providerId] || FREE_TIER_PROVIDERS[providerId] || WEB_COOKIE_PROVIDERS[providerId]);
   const authModes = providerInfo?.authModes || [];
   const isOAuth = !!OAUTH_PROVIDERS[providerId] || !!FREE_PROVIDERS[providerId] || authModes.includes("oauth");
+  const supportsRelogin = isOAuth && !RELOGIN_UNSUPPORTED.has(providerId);
   const supportsApiKeyAuth = !!APIKEY_PROVIDERS[providerId] || authModes.includes("apikey");
   const isFreeNoAuth = !!FREE_PROVIDERS[providerId]?.noAuth;
   const staticModels = getModelsByProviderId(providerId);
@@ -827,7 +845,7 @@ export default function ProviderDetailPage() {
 
   const handleOAuthSuccess = () => {
     fetchConnections();
-    setShowOAuthModal(false);
+    closeOAuthModal();
   };
 
   const handleIFlowCookieSuccess = () => {
@@ -1068,6 +1086,7 @@ export default function ProviderDetailPage() {
                   setSelectedConnection(conn);
                   setShowEditModal(true);
                 }}
+                onRelogin={supportsRelogin && conn.reauthRequiredAt ? () => openRelogin(conn.id) : null}
                 onDelete={() => handleDelete(conn.id)}
                 oneByOneStatus={oneByOneResults[conn.id] || null}
               />
@@ -1860,7 +1879,8 @@ export default function ProviderDetailPage() {
           provider={providerId}
           providerInfo={providerInfo}
           onSuccess={handleOAuthSuccess}
-          onClose={() => setShowOAuthModal(false)}
+          onClose={closeOAuthModal}
+          reauthConnectionId={reauthConnectionId}
         />
       )}
 
