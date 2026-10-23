@@ -20,6 +20,7 @@ import { handleComboChat, handleFusionChat, detectRequiredCapabilities } from "o
 import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActiveAdapterStrategy } from "open-sse/services/capacityAdapter.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
+import { LOCKOUT_HOLD_MAX_MS } from "open-sse/config/errorConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import * as log from "../utils/logger.js";
 import { getSessionKey, getRejectionInfo } from "open-sse/services/claudeQuotaTracker.js";
@@ -123,7 +124,7 @@ export async function handleChat(request, clientRawRequest = null) {
             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
             cleanRawReq = { ...clientRawRequest, body: cleanBody };
           }
-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, { holdLockouts: false });
         },
         log,
         comboName: modelStr,
@@ -138,7 +139,7 @@ export async function handleChat(request, clientRawRequest = null) {
       body,
       models: augmentedModels,
       handleSingleModel: withCapacityAdapterStripping(
-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, { holdLockouts: augmentedModels.length === 1 }),
         adapterAdded
       ),
       log,
@@ -158,7 +159,7 @@ export async function handleChat(request, clientRawRequest = null) {
       body,
       models: soloAugmented,
       handleSingleModel: withCapacityAdapterStripping(
-        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+        (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, { holdLockouts: false }),
         adapterAdded
       ),
       log,
@@ -173,7 +174,7 @@ export async function handleChat(request, clientRawRequest = null) {
 /**
  * Handle single model chat request
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null) {
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, requestedModel = null, { holdLockouts = true } = {}) {
   const modelInfo = await getModelInfo(modelStr);
 
   // If provider is null, this might be a combo name - check and handle
@@ -203,7 +204,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
               cleanRawReq = { ...clientRawRequest, body: cleanBody };
             }
-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey);
+            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, null, { holdLockouts: false });
           },
           log,
           comboName: modelStr,
@@ -218,7 +219,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         body,
         models: augmentedModels,
         handleSingleModel: withCapacityAdapterStripping(
-          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey),
+          (b, m) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, null, { holdLockouts: holdLockouts && augmentedModels.length === 1 }),
           adapterAdded
         ),
         log,
@@ -243,6 +244,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   let lastError = null;
   let lastStatus = null;
   let lastHeaders = null;
+  let holdDeadline = null;
 
   const sessionKey = getSessionKey(clientRawRequest?.headers, body);
 
@@ -252,6 +254,18 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
+        if (holdLockouts) {
+          holdDeadline ??= Date.now() + LOCKOUT_HOLD_MAX_MS;
+          const waitMs = lockoutWaitMs(credentials.retryAfter);
+          if (waitMs !== null && Date.now() + waitMs <= holdDeadline) {
+            log.warn("CHAT", `[${provider}/${model}] all accounts locked, holding request ${Math.ceil(waitMs / 1000)}s until the first lock clears`);
+            if (await sleepUnlessAborted(waitMs, request?.signal)) {
+              // Accounts that failed earlier in this request carry their own locks now.
+              excludeConnectionIds.clear();
+              continue;
+            }
+          }
+        }
         const errorMsg = lastError || credentials.lastError || "Unavailable";
         const status = HTTP_STATUS.SERVICE_UNAVAILABLE;
         log.warn("CHAT", `[${provider}/${model}] ${errorMsg} (${credentials.retryAfterHuman})`);
@@ -380,4 +394,27 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     return result.response;
   }
+}
+
+// Wake a little after the lock expires, spread out so held requests don't all land on
+// the same freed account at once.
+function lockoutWaitMs(retryAfter) {
+  const until = retryAfter ? new Date(retryAfter).getTime() : NaN;
+  if (!Number.isFinite(until)) return null;
+  return Math.max(until - Date.now(), 0) + 250 + Math.floor(Math.random() * 750);
+}
+
+function sleepUnlessAborted(ms, signal) {
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.("abort", onAbort);
+      resolve(true);
+    }, ms);
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+  });
 }

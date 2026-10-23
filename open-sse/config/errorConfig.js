@@ -41,6 +41,11 @@ export const TRANSIENT_COOLDOWN_MS = 30 * 1000;
 // Hard cap for provider-reported rate limit cooldown (e.g. codex resets_at can be 5-6h)
 export const MAX_RATE_LIMIT_COOLDOWN_MS = 30 * 60 * 1000;
 
+// When every account is locked but the first lock clears soon, a chat request waits
+// for it instead of failing. This caps the total wait per request, so a real outage
+// still returns an error.
+export const LOCKOUT_HOLD_MAX_MS = 3 * 60 * 1000;
+
 // Cooldown durations (ms)
 const COOLDOWN = {
   long: 2 * 60 * 1000,

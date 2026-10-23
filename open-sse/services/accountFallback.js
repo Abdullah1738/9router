@@ -140,6 +140,15 @@ export function isModelLockActive(connection, model) {
 }
 
 /**
+ * Expiry (ISO) of the lock that blocks `model` on this connection, or null.
+ * Reads the same field isModelLockActive does.
+ */
+export function getModelLockUntil(connection, model) {
+  if (!isModelLockActive(connection, model)) return null;
+  return connection[getModelLockKey(model)] || connection[MODEL_LOCK_ALL];
+}
+
+/**
  * Get earliest active model lock expiry across all modelLock_* fields.
  * Used for UI cooldown display.
  */

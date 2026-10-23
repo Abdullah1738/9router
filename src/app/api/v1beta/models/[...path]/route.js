@@ -102,6 +102,8 @@ export async function POST(request, { params }) {
       method: "POST",
       headers: request.headers,
       body: JSON.stringify(convertedBody),
+      // Keep the client's disconnect visible to the handler (it stops held requests).
+      signal: request.signal,
     });
 
     const response = await handleChat(newRequest);

@@ -1,6 +1,6 @@
 import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools } from "@/lib/localDb";
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
-import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
+import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil, getModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { QUOTA_AWARE_STRATEGY } from "open-sse/config/claudeQuotaRouting.js";
 import { getQuotaLockUntil, getRejectionInfo, selectQuotaAware } from "open-sse/services/claudeQuotaTracker.js";
@@ -92,22 +92,30 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     const quotaLockUntil = (c) => (isClaude && c.authType === "oauth" ? getQuotaLockUntil(c.id) : 0);
     const antigravityQuotaCache = isAntigravity && model ? getAntigravityQuotaCache() : null;
 
+    const skipsModel = (c) => {
+      const enabled = c.providerSpecificData?.enabledModels;
+      return providerId === "codex" && Array.isArray(enabled) && enabled.length > 0 && !!requestedModel && !enabled.includes(requestedModel);
+    };
+    // Antigravity: live quota exhausted for this model, until its reset.
+    const antigravityResetAt = (c) => {
+      if (!antigravityQuotaCache) return null;
+      const connQuotas = antigravityQuotaCache.get(c.id);
+      const quota = getAntigravityModelQuota(connQuotas, model) || connQuotas?.[model];
+      if (quota && quota.remainingPercentage <= 0 && quota.resetAt && new Date(quota.resetAt).getTime() > Date.now()) return quota.resetAt;
+      return null;
+    };
+
     // Filter out model-locked, excluded, and Antigravity quota-exhausted connections.
     const availableConnections = connections.filter(c => {
       if (excludeSet.has(c.id)) return false;
       if (isModelLockActive(c, model)) return false;
       if (quotaLockUntil(c)) return false;
-      const enabled = c.providerSpecificData?.enabledModels;
-      if (providerId === "codex" && Array.isArray(enabled) && enabled.length && requestedModel && !enabled.includes(requestedModel)) return false;
-      // Antigravity: skip if live quota exhausted for this model
-      if (isAntigravity && model && antigravityQuotaCache) {
-        const connQuotas = antigravityQuotaCache.get(c.id);
-        const quota = getAntigravityModelQuota(connQuotas, model) || connQuotas?.[model];
-        if (quota && quota.remainingPercentage <= 0 && quota.resetAt && new Date(quota.resetAt).getTime() > Date.now()) {
-          const account = c.id?.slice(0, 8) || "unknown";
-          log.info("AG_QUOTA", `${account} | CACHE_BLOCK ${model} — skip upstream until ${quota.resetAt}`);
-          return false;
-        }
+      if (skipsModel(c)) return false;
+      const agResetAt = antigravityResetAt(c);
+      if (agResetAt) {
+        const account = c.id?.slice(0, 8) || "unknown";
+        log.info("AG_QUOTA", `${account} | CACHE_BLOCK ${model} — skip upstream until ${agResetAt}`);
+        return false;
       }
       return true;
     });
@@ -123,23 +131,22 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     });
 
     if (availableConnections.length === 0) {
-      // Find earliest persistent lock or lazy Antigravity quota-cache reset for retry timing.
-      const lockedConns = connections.filter(c => isModelLockActive(c, model) || quotaLockUntil(c));
-      const expiries = lockedConns.map(c => {
-        const q = quotaLockUntil(c);
-        return q ? new Date(q).toISOString() : getEarliestModelLockUntil(c);
-      }).filter(Boolean);
-      if (isAntigravity && model && antigravityQuotaCache) {
-        connections.forEach((c) => {
-          const connQuotas = antigravityQuotaCache.get(c.id);
-          const quota = getAntigravityModelQuota(connQuotas, model) || connQuotas?.[model];
-          const resetAt = quota?.resetAt;
-          if (resetAt && new Date(resetAt).getTime() > Date.now()) expiries.push(resetAt);
-        });
-      }
-      const earliest = expiries.sort()[0] || null;
+      // An account comes back for this model once every lock on it clears (model
+      // lock, quota lock, Antigravity reset). Accounts that never serve this model don't count.
+      const locked = connections.map((c) => {
+        if (skipsModel(c)) return null;
+        const modelLock = getModelLockUntil(c, model);
+        const agResetAt = antigravityResetAt(c);
+        const until = Math.max(
+          modelLock ? new Date(modelLock).getTime() : 0,
+          quotaLockUntil(c) || 0,
+          agResetAt ? new Date(agResetAt).getTime() : 0,
+        );
+        return until > Date.now() ? { conn: c, until } : null;
+      }).filter(Boolean).sort((a, b) => a.until - b.until);
+      const earliest = locked.length ? new Date(locked[0].until).toISOString() : null;
       if (earliest) {
-        const earliestConn = lockedConns[0];
+        const earliestConn = locked[0].conn;
         log.warn("AUTH", `${provider} | all ${connections.length} accounts locked for ${model || "all"} (${formatRetryAfter(earliest)}) | lastError=${earliestConn?.lastError?.slice(0, 50)}`);
         return {
           allRateLimited: true,
