@@ -55,6 +55,8 @@ export function selectConnectionsNeedingRefresh(connections, nowMs = Date.now())
     const authType = String(conn.authType || "").toLowerCase().replace(/_/g, "");
     if (authType !== "oauth") continue;
     if (!conn.refreshToken) continue;
+    // The provider already rejected this refresh token; retrying every tick only spams the log.
+    if (conn.reauthRequiredAt) continue;
 
     const expiresAtMs = getCredentialExpiryMs(conn);
     if (expiresAtMs === null) continue;

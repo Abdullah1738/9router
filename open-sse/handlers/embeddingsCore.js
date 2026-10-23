@@ -91,7 +91,11 @@ export async function handleEmbeddingsCore({
     if (newCredentials?.accessToken || newCredentials?.apiKey) {
       log?.info?.("TOKEN", `${provider.toUpperCase()} | refreshed for embeddings`);
       Object.assign(credentials, newCredentials);
-      if (onCredentialsRefreshed) await onCredentialsRefreshed(newCredentials);
+      if (onCredentialsRefreshed) {
+        // A refresh that lost a race to newer stored tokens gets those tokens back.
+        const stored = await onCredentialsRefreshed(newCredentials);
+        if (stored?.accessToken) Object.assign(credentials, stored);
+      }
 
       try {
         const retryHeaders = adapter.buildHeaders(credentials, ctx);

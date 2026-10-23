@@ -22,11 +22,8 @@ export async function refreshXaiToken(refreshToken, log) {
       };
     } catch (e) {
       log?.warn?.("TOKEN_REFRESH", `xai refresh failed: ${e?.message || e}`);
-      const msg = String(e?.message || "");
-      if (msg.includes("invalid_grant") || msg.includes("invalid_request")) {
-        return { error: "invalid_grant" };
-      }
-      return null;
+      const code = getPermanentRefreshRejection(e?.status, e?.body);
+      return code ? { error: "unrecoverable_refresh_error", code } : null;
     }
   }, log);
 }
@@ -115,6 +112,9 @@ export async function refreshAccessToken(provider, refreshToken, credentials, lo
         status: response.status,
         error: errorText,
       });
+      // A dead grant never recovers by retrying; callers take the login out of rotation.
+      const code = getPermanentRefreshRejection(response.status, errorText);
+      if (code) return { error: "unrecoverable_refresh_error", code };
       return null;
     }
 
@@ -254,6 +254,34 @@ export function classifyOAuthRefreshError(errorText = "", status = 0) {
   return { status, code, description, permanent };
 }
 
+const PERMANENT_REFRESH_CODES = new Set([
+  "invalid_grant",
+  "refresh_token_expired",
+  "refresh_token_reused",
+  "refresh_token_invalidated",
+]);
+
+// Strict check used before a login is taken out of rotation: only a 400/401
+// whose structured error code says the grant itself is gone. Outages, other
+// error codes and free text that happens to mention invalid_grant don't count.
+export function getPermanentRefreshRejection(status, errorText = "") {
+  if (status !== 400 && status !== 401) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(errorText);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const err = parsed.error;
+  const codes = typeof err === "string" ? [err] : [err?.code, err?.type, parsed.error_code];
+  return codes.find((code) => typeof code === "string" && PERMANENT_REFRESH_CODES.has(code)) || null;
+}
+
+export function isPermanentRefreshCode(code) {
+  return typeof code === "string" && PERMANENT_REFRESH_CODES.has(code);
+}
+
 export async function refreshCodexToken(refreshToken, log) {
   if (!refreshToken) return null;
   return dedupRefresh("codex", refreshToken, async () => {
@@ -274,12 +302,13 @@ export async function refreshCodexToken(refreshToken, log) {
       if (!response.ok) {
         const errorText = await response.text();
         const failure = classifyOAuthRefreshError(errorText, response.status);
-        if (failure.permanent) {
+        const rejected = getPermanentRefreshRejection(response.status, errorText);
+        if (rejected) {
           log?.error?.("TOKEN_REFRESH", "Codex refresh token already used or invalid. Re-auth required.", {
             status: response.status,
-            code: failure.code,
+            code: rejected,
           });
-          return { error: "unrecoverable_refresh_error", code: failure.code };
+          return { error: "unrecoverable_refresh_error", code: rejected };
         }
 
         log?.error?.("TOKEN_REFRESH", "Failed to refresh Codex token", {

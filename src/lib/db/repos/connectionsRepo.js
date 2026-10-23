@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { v4 as uuidv4 } from "uuid";
 import { getAdapter } from "../driver.js";
 import { parseJson, stringifyJson } from "../helpers/jsonCol.js";
@@ -32,10 +33,66 @@ function resetHealthStateOnActivation(existing, patch) {
   return normalized;
 }
 
+const REAUTH_HEALTH_FIELDS = ["testStatus", "lastError", "lastErrorAt", "errorCode", "lastErrorType"];
+
+const REAUTH_ERROR = "Refresh token rejected. Log in again to bring this account back.";
+
+// Ties a mark to the exact tokens the row held when the refresh token was rejected.
+function reauthTokenFingerprint(conn) {
+  return createHash("sha256")
+    .update(`${conn.refreshToken || ""}\n${conn.accessToken || ""}`)
+    .digest("hex")
+    .slice(0, 16);
+}
+
+// The mark only covers the tokens that were rejected. Once the row holds other
+// ones (a refresh or login written by code that doesn't know about the mark,
+// like the previous worker during a reload), the mark is stale and dropped.
+function reconcileReauthMark(conn) {
+  if (!conn.reauthRequiredAt) return conn;
+  if (conn.reauthTokenHash === reauthTokenFingerprint(conn)) {
+    return { ...conn, testStatus: "expired", lastErrorType: "token_expired", lastError: conn.lastError || REAUTH_ERROR };
+  }
+  const { reauthRequiredAt, reauthTokenHash, ...rest } = conn;
+  if (rest.lastErrorType !== "token_expired") return rest;
+  return { ...rest, testStatus: "active", lastErrorType: null, lastError: null, errorCode: null };
+}
+
+// A login whose refresh token died stays marked until it logs in again, or a
+// refresh of the token the row holds right now gets a new access token. Anything
+// else (a request still riding the old access token, a token-preserving refresh
+// like GitHub's Copilot mint) leaves the mark and its error alone.
+function applyReauthState(existing, patch, { login = false, refreshedFrom = null } = {}) {
+  if (!existing?.reauthRequiredAt || !patch) return patch;
+
+  const cleared = Object.hasOwn(patch, "reauthRequiredAt") && !patch.reauthRequiredAt;
+  const refreshedCurrent = !!refreshedFrom && refreshedFrom === existing.refreshToken
+    && !!patch.refreshToken && !!patch.accessToken && patch.accessToken !== existing.accessToken;
+  if (cleared || login || refreshedCurrent) {
+    return {
+      ...patch,
+      reauthRequiredAt: null,
+      reauthTokenHash: null,
+      lastErrorType: Object.hasOwn(patch, "lastErrorType") ? patch.lastErrorType : null,
+      testStatus: patch.testStatus || "active",
+    };
+  }
+
+  const kept = { ...patch };
+  delete kept.reauthRequiredAt;
+  delete kept.reauthTokenHash;
+  for (const field of REAUTH_HEALTH_FIELDS) delete kept[field];
+  return kept;
+}
+
+function normalizePatch(existing, patch, options) {
+  return resetHealthStateOnActivation(existing, applyReauthState(existing, patch, options));
+}
+
 function rowToConn(row) {
   if (!row) return null;
   const extra = parseJson(row.data, {});
-  return {
+  return reconcileReauthMark({
     ...extra,
     id: row.id,
     provider: row.provider,
@@ -46,7 +103,7 @@ function rowToConn(row) {
     isActive: row.isActive === 1 || row.isActive === true,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
-  };
+  });
 }
 
 function connToRow(c) {
@@ -209,8 +266,8 @@ export async function createProviderConnection(data) {
         err.existingName = existing.name;
         throw err;
       }
-      const normalized = resetHealthStateOnActivation(existing, data);
-      const merged = { ...existing, ...normalized, updatedAt: now };
+      const normalized = normalizePatch(existing, data, { login: true });
+      const merged = reconcileReauthMark({ ...existing, ...normalized, updatedAt: now });
       upsert(db, merged);
       result = merged;
       return;
@@ -259,19 +316,54 @@ export async function createProviderConnection(data) {
   return result;
 }
 
-// Critical: OAuth refresh token race — atomic merge inside transaction
-export async function updateProviderConnection(id, data) {
+// Critical: OAuth refresh token race — atomic merge inside transaction.
+// `refreshedFrom` is the refresh token a refresh result was made with.
+export async function updateProviderConnection(id, data, { refreshedFrom = null } = {}) {
   const db = await getAdapter();
   let result;
   db.transaction(() => {
     const row = db.get(`SELECT * FROM providerConnections WHERE id = ?`, [id]);
     if (!row) { result = null; return; }
     const existing = rowToConn(row);
-    const normalized = resetHealthStateOnActivation(existing, data);
-    const merged = { ...existing, ...normalized, updatedAt: new Date().toISOString() };
+    // A refresh made with a token the row no longer holds is stale: the row
+    // already has newer tokens (another refresh, or a new login). Keep them.
+    if (refreshedFrom && refreshedFrom !== existing.refreshToken) { result = existing; return; }
+    const normalized = normalizePatch(existing, data, { refreshedFrom });
+    const merged = reconcileReauthMark({ ...existing, ...normalized, updatedAt: new Date().toISOString() });
     upsert(db, merged);
     if (data.priority !== undefined) reorderInTx(db, existing.provider);
     result = merged;
+  });
+  return result;
+}
+
+// Takes a login out of rotation after its refresh token was rejected for good.
+// `refreshToken` is the token that failed: if the row already holds a different
+// one (rotated by another request, or a fresh login), nothing changes.
+export async function markConnectionReauthRequired(id, { refreshToken, reason } = {}) {
+  const db = await getAdapter();
+  let result = { changed: false, connection: null };
+  db.transaction(() => {
+    const row = db.get(`SELECT * FROM providerConnections WHERE id = ?`, [id]);
+    if (!row) return;
+    const existing = rowToConn(row);
+    if (existing.reauthRequiredAt) { result = { changed: false, connection: existing }; return; }
+    if (refreshToken && existing.refreshToken !== refreshToken) { result = { changed: false, connection: existing }; return; }
+
+    const now = new Date().toISOString();
+    const merged = {
+      ...existing,
+      reauthRequiredAt: now,
+      reauthTokenHash: reauthTokenFingerprint(existing),
+      testStatus: "expired",
+      lastErrorType: "token_expired",
+      lastError: reason || REAUTH_ERROR,
+      lastErrorAt: now,
+      errorCode: 401,
+      updatedAt: now,
+    };
+    upsert(db, merged);
+    result = { changed: true, connection: merged };
   });
   return result;
 }

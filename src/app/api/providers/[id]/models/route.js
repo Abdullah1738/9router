@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getProviderConnectionById } from "@/models";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/shared/constants/providers";
 import { GEMINI_CONFIG, ZED_HOSTED_CONFIG } from "@/lib/oauth/constants/oauth";
-import { refreshGoogleToken, refreshCodexToken, updateProviderCredentials } from "@/sse/services/tokenRefresh";
+import { refreshGoogleToken, refreshCodexToken, updateProviderCredentials, storedTokensIfStale } from "@/sse/services/tokenRefresh";
 import { resolveOllamaLocalHost } from "open-sse/config/providers.js";
 import { getModelsByProviderId } from "open-sse/config/providerModels.js";
 import { resolveKiroModels } from "open-sse/services/kiroModels.js";
@@ -98,14 +98,16 @@ const buildOAuthResolver = ({ refreshFn, fetchFn, parseFn, errorLabel }) => asyn
     if (!response.ok && (response.status === 401 || response.status === 403) && refreshToken) {
       const refreshed = await refreshFn(connection);
       if (refreshed?.accessToken) {
-        await updateProviderCredentials(connection.id, {
+        const stored = await updateProviderCredentials(connection.id, {
           accessToken: refreshed.accessToken,
           refreshToken: refreshed.refreshToken || refreshToken,
           expiresIn: refreshed.expiresIn,
-        });
-        connection.accessToken = refreshed.accessToken;
-        if (refreshed.refreshToken) connection.refreshToken = refreshed.refreshToken;
-        response = await fetchFn(refreshed.accessToken, connection);
+        }, { refreshedFrom: refreshToken });
+        // A refresh that lost a race to a newer login keeps the stored tokens.
+        const current = storedTokensIfStale(stored, refreshed) || refreshed;
+        connection.accessToken = current.accessToken;
+        if (current.refreshToken) connection.refreshToken = current.refreshToken;
+        response = await fetchFn(current.accessToken, connection);
       }
     }
     if (response.ok) {
@@ -426,13 +428,16 @@ const PROVIDER_MODELS_CONFIG = {
           log: console,
           onCredentialsRefreshed: async (refreshed) => {
             if (refreshed?.accessToken) {
-              await updateProviderCredentials(connection.id, {
+              const stored = await updateProviderCredentials(connection.id, {
                 accessToken: refreshed.accessToken,
                 refreshToken: refreshed.refreshToken || connection.refreshToken,
                 expiresIn: refreshed.expiresIn,
-              });
-              connection.accessToken = refreshed.accessToken;
-              if (refreshed.refreshToken) connection.refreshToken = refreshed.refreshToken;
+              }, { refreshedFrom: connection.refreshToken });
+              const stale = storedTokensIfStale(stored, refreshed);
+              const current = stale || refreshed;
+              connection.accessToken = current.accessToken;
+              if (current.refreshToken) connection.refreshToken = current.refreshToken;
+              return stale;
             }
           }
         });
@@ -496,10 +501,11 @@ const PROVIDER_MODELS_CONFIG = {
           strictProxy: proxy.strictProxy === true,
         },
         onCredentialsRefreshed: async (refreshed) => {
-          await updateProviderCredentials(connection.id, {
+          const stored = await updateProviderCredentials(connection.id, {
             ...refreshed,
             existingProviderSpecificData: connection.providerSpecificData || {},
-          });
+          }, { refreshedFrom: refreshed.refreshedFrom || connection.refreshToken });
+          return storedTokensIfStale(stored, refreshed);
         },
       });
       if (result.models.length) return result;

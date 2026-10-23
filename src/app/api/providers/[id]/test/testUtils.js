@@ -357,7 +357,8 @@ async function testOAuthConnection(connection, effectiveProxy = null) {
   const tokenExpired = isTokenExpired(connection);
   if (config.refreshable && tokenExpired && connection.refreshToken) {
     const tokens = await refreshOAuthToken(connection);
-    if (tokens) {
+    // A rejected grant comes back as an error object, not tokens.
+    if (tokens?.accessToken) {
       accessToken = tokens.accessToken;
       refreshed = true;
       newTokens = tokens;
@@ -438,7 +439,7 @@ async function testOAuthConnection(connection, effectiveProxy = null) {
 
     if (res.status === 401 && config.refreshable && !refreshed && connection.refreshToken) {
       const tokens = await refreshOAuthToken(connection);
-      if (tokens) {
+      if (tokens?.accessToken) {
         const retryUrl = config.buildUrl ? config.buildUrl(tokens.accessToken) : testUrl;
         const retryHeaders = config.noAuth
           ? { ...config.extraHeaders }
@@ -945,7 +946,12 @@ export async function testSingleConnection(id) {
     }
   }
 
-  await updateProviderConnection(id, updateData);
+  // A test that refreshed carries the token it used, so a login waiting for
+  // re-login comes back only when that refresh really worked.
+  const refreshedFrom = result.refreshed && result.newTokens
+    ? result.newTokens.refreshedFrom || connection.refreshToken
+    : null;
+  await updateProviderConnection(id, updateData, { refreshedFrom });
 
   return { valid: result.valid, error: result.error, refreshed: !!result.refreshed, latencyMs, testedAt: new Date().toISOString() };
 }

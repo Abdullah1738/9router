@@ -73,11 +73,14 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       };
     }
 
-    const connections = await getProviderConnections({ provider: providerId, isActive: true });
+    const activeConnections = await getProviderConnections({ provider: providerId, isActive: true });
+    // Logins whose refresh token died stay out of rotation until someone logs them in again.
+    const connections = activeConnections.filter(c => !c.reauthRequiredAt);
+    const needsRelogin = activeConnections.length - connections.length;
     log.debug("AUTH", `${provider} | total connections: ${connections.length}, excludeIds: ${excludeSet.size > 0 ? [...excludeSet].join(",") : "none"}, model: ${model || "any"}`);
 
     if (connections.length === 0) {
-      log.warn("AUTH", `No credentials for ${provider}`);
+      log.warn("AUTH", needsRelogin ? `${provider} | all ${needsRelogin} accounts need re-login` : `No credentials for ${provider}`);
       return null;
     }
 

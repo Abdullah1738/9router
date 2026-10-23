@@ -112,15 +112,19 @@ export async function refreshAndUpdateCredentials(connection, force = false, pro
     };
   }
 
-  // Update database
-  await updateProviderConnection(connection.id, updateData);
+  // Update database; refreshedFrom drops the write if the row moved to newer tokens meanwhile.
+  const stored = await updateProviderConnection(connection.id, updateData, {
+    refreshedFrom: refreshResult.refreshedFrom || credentials.refreshToken,
+  });
 
-  // Return updated connection
-  const updatedConnection = {
-    ...connection,
-    ...updateData,
-    providerSpecificData: updateData.providerSpecificData || connection.providerSpecificData,
-  };
+  // Return the connection as stored (a stale write leaves the row's newer tokens in place)
+  const updatedConnection = stored
+    ? { ...connection, ...stored }
+    : {
+      ...connection,
+      ...updateData,
+      providerSpecificData: updateData.providerSpecificData || connection.providerSpecificData,
+    };
 
   return {
     connection: updatedConnection,

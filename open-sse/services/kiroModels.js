@@ -262,7 +262,11 @@ export async function resolveKiroModels(credentials, options = {}) {
       if (refreshed?.accessToken) {
         const next = { ...credentials, ...refreshed };
         if (typeof options.onCredentialsRefreshed === "function") {
-          try { await options.onCredentialsRefreshed(refreshed); } catch (e) {
+          try {
+            // A refresh that lost a race to newer stored tokens gets those tokens back.
+            const stored = await options.onCredentialsRefreshed(refreshed);
+            if (stored?.accessToken) Object.assign(next, stored);
+          } catch (e) {
             options.log?.warn?.("KIRO_MODELS", `onCredentialsRefreshed failed: ${e?.message || e}`);
           }
         }

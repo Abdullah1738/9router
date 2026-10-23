@@ -101,7 +101,9 @@ export async function resolveGrokCliModels(credentials, options = {}) {
       if (refreshed?.accessToken) {
         accessToken = refreshed.accessToken;
         try {
-          await onCredentialsRefreshed?.(refreshed);
+          // A refresh that lost a race to newer stored tokens gets those tokens back.
+          const stored = await onCredentialsRefreshed?.(refreshed);
+          if (stored?.accessToken) accessToken = stored.accessToken;
         } catch (error) {
           log?.warn?.("Grok CLI credential persistence failed", error);
         }

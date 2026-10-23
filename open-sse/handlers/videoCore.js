@@ -160,7 +160,11 @@ export async function handleVideoProxyCore({
     if (refreshed?.accessToken) {
       log?.info?.("TOKEN", `${provider.toUpperCase()} | refreshed for video ${method}`);
       Object.assign(credentials, refreshed);
-      if (onCredentialsRefreshed) await onCredentialsRefreshed(refreshed);
+      if (onCredentialsRefreshed) {
+        // A refresh that lost a race to newer stored tokens gets those tokens back.
+        const stored = await onCredentialsRefreshed(refreshed);
+        if (stored?.accessToken) Object.assign(credentials, stored);
+      }
       try {
         await upstream.body?.cancel?.();
       } catch { /* noop */ }

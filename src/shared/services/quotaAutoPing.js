@@ -272,7 +272,7 @@ export async function runQuotaAutoPingTick(deps = createDefaultDeps(), state = g
       if (Object.keys(enabledMap).length === 0) continue;
 
       const conns = await deps.getProviderConnections({ provider, isActive: true });
-      const targets = conns.filter((conn) => conn.authType === "oauth" && enabledMap[conn.id] === true);
+      const targets = conns.filter((conn) => conn.authType === "oauth" && !conn.reauthRequiredAt && enabledMap[conn.id] === true);
       for (const conn of targets) {
         try {
           await pingConnection(conn, provider, providerConfig, handler, deps, state);

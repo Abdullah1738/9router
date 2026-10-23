@@ -200,6 +200,8 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
     log.info("AUTH", `\x1b[32mUsing ${providerId} account: ${credentials.connectionName}\x1b[0m`);
 
     const refreshedCredentials = await checkAndRefreshToken(providerId, credentials);
+    // The core rotates credentials in place before calling back; keep the token it refreshes with.
+    const refreshedFrom = refreshedCredentials.refreshToken;
 
     const result = await handleSearchCore({
       body: coreBody,
@@ -213,7 +215,7 @@ async function handleSingleProviderSearch(body, providerInput, request, apiKey, 
           refreshToken: newCreds.refreshToken,
           providerSpecificData: newCreds.providerSpecificData,
           testStatus: "active"
-        });
+        }, { refreshedFrom: newCreds.refreshedFrom || refreshedFrom });
       },
       onRequestSuccess: async () => {
         await clearAccountError(credentials.connectionId, credentials);

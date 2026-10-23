@@ -151,6 +151,9 @@ export async function refreshProviderCredentials(provider, credentials, log) {
 
   return withCredentialRefreshLock(provider, credentials, async () => {
     const refreshed = await refreshTokenByProvider(provider, credentials, log);
-    return mergeRefreshedCredentials(provider, credentials, refreshed);
+    const merged = mergeRefreshedCredentials(provider, credentials, refreshed);
+    // Callers joining this refresh may hold another token (e.g. a new login
+    // landed meanwhile); tell them which one the result belongs to.
+    return merged ? { ...merged, refreshedFrom: credentials.refreshToken } : merged;
   });
 }

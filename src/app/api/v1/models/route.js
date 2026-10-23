@@ -17,7 +17,7 @@ import { resolveClinepassModels, resolveClineModels } from "open-sse/services/cl
 import { resolveGrokCliModels } from "open-sse/services/grokCliModels.js";
 import { resolveCursorModels } from "open-sse/services/cursorModels.js";
 import { resolveZedModels } from "open-sse/shared/zedAuth.js";
-import { updateProviderCredentials } from "@/sse/services/tokenRefresh";
+import { updateProviderCredentials, storedTokensIfStale } from "@/sse/services/tokenRefresh";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { capabilitiesFromServiceKind, getCapabilitiesForModel, aggregateComboCapabilities } from "open-sse/providers/capabilities.js";
 
@@ -126,10 +126,11 @@ const LIVE_MODEL_RESOLVERS = {
         strictProxy: proxy.strictProxy === true,
       },
       onCredentialsRefreshed: async (refreshed) => {
-        await updateProviderCredentials(conn.id, {
+        const stored = await updateProviderCredentials(conn.id, {
           ...refreshed,
           existingProviderSpecificData: conn.providerSpecificData || {},
-        });
+        }, { refreshedFrom: refreshed.refreshedFrom || conn.refreshToken });
+        return storedTokensIfStale(stored, refreshed);
       },
     });
     return result?.models?.length ? { models: result.models } : null;

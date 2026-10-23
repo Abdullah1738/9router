@@ -4,7 +4,7 @@ import { applyThinking, extractThinking, stripThinkingSuffix } from "../translat
 import { FORMATS } from "../translator/formats.js";
 import { normalizeClaudePassthrough, anchorClaudeCache } from "../translator/formats/claude.js";
 import { createStreamController } from "../utils/streamHandler.js";
-import { refreshWithRetry } from "../services/tokenRefresh.js";
+import { refreshWithRetry, isUnrecoverableRefreshError } from "../services/tokenRefresh.js";
 import { createRequestLogger } from "../utils/requestLogger.js";
 import { getModelTargetFormat, getModelSupportedFormats, getModelStrip, getModelUpstreamId, getModelType, PROVIDER_ID_TO_ALIAS } from "../config/providerModels.js";
 import { PROVIDERS } from "../config/providers.js";
@@ -61,7 +61,7 @@ export function stripContinuityFields(body) {
   return body;
 }
 
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRefreshTokenRejected, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
   // Stable per-session color so all lines of one CLI conversation share a tag
@@ -437,8 +437,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       // providers (xAI/grok-cli) issue a new RT on every refresh; without this,
       // refreshWithRetry's 2nd/3rd attempt reuses the already-consumed RT →
       // invalid_grant → auth_failed retryable=false.
+      let usedRefreshToken = credentials.refreshToken;
       const newCredentials = await refreshWithRetry(async () => {
+        usedRefreshToken = credentials.refreshToken;
         const result = await executor.refreshCredentials(credentials, log);
+        if (result?.refreshedFrom) usedRefreshToken = result.refreshedFrom;
         if (result?.refreshToken && result.refreshToken !== credentials.refreshToken) {
           if (result.accessToken) credentials.accessToken = result.accessToken;
           credentials.refreshToken = result.refreshToken;
@@ -449,7 +452,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
         if (log?.line) log.line(reqTag, "🔑", `TOKEN REFRESHED · ${provider}/${model}`);
         Object.assign(credentials, newCredentials);
         if (onCredentialsRefreshed) {
-          try { await onCredentialsRefreshed(newCredentials); } catch (e) { log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${e.message}`); }
+          try {
+            // A refresh that lost a race to newer stored tokens gets those tokens back.
+            const stored = await onCredentialsRefreshed(newCredentials, usedRefreshToken);
+            if (stored?.accessToken) Object.assign(credentials, stored);
+          } catch (e) { log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${e.message}`); }
         }
         try {
           const retryResult = await executor.execute({
@@ -472,6 +479,9 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
         } catch { log?.warn?.("TOKEN", `${provider.toUpperCase()} | retry after refresh failed`); }
       } else {
         log?.warn?.("TOKEN", `${provider.toUpperCase()} | refresh failed`);
+        if (onRefreshTokenRejected && isUnrecoverableRefreshError(newCredentials)) {
+          try { await onRefreshTokenRejected(newCredentials, usedRefreshToken); } catch (e) { log?.warn?.("TOKEN", `onRefreshTokenRejected failed: ${e.message}`); }
+        }
       }
     } catch (e) {
       log?.warn?.("TOKEN", `${provider.toUpperCase()} | refresh threw: ${e.message}`);

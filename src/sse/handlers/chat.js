@@ -23,7 +23,7 @@ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import * as log from "../utils/logger.js";
 import { getSessionKey, getRejectionInfo } from "open-sse/services/claudeQuotaTracker.js";
-import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
+import { updateProviderCredentials, checkAndRefreshToken, markRefreshTokenRejected, storedTokensIfStale } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 import { stripModelContextMarker } from "open-sse/utils/modelMarkers.js";
 import { getKeyAccessContext, enforceKeyAccess, filterAdapterModels } from "../services/keyAccess.js";
@@ -267,6 +267,11 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // Account selection shown in the unified "▶" line (acc:...)
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
+    if (refreshedCredentials.needsRelogin) {
+      // Its refresh token was just rejected, so it is out of rotation until it logs in again.
+      excludeConnectionIds.add(credentials.connectionId);
+      continue;
+    }
 
     // Ensure real project ID is available for providers that need it (P0 fix: cold miss)
     if ((provider === "antigravity" || provider === "gemini-cli") && !refreshedCredentials.projectId) {
@@ -279,6 +284,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     }
 
     // Use shared chatCore
+    let refreshTokenRejected = false;
     const chatSettings = await getSettings();
     const providerThinking = (chatSettings.providerThinking || {})[provider] || null;
     const result = await handleChatCore({
@@ -311,12 +317,16 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       providerOverrides: (chatSettings.providerOverrides || {})[provider] || null,
       // Detect source format by endpoint + body
       sourceFormatOverride: request?.url ? detectFormatByEndpoint(new URL(request.url).pathname, body) : null,
-      onCredentialsRefreshed: async (newCreds) => {
-        await updateProviderCredentials(credentials.connectionId, {
+      onCredentialsRefreshed: async (newCreds, refreshedFrom) => {
+        const stored = await updateProviderCredentials(credentials.connectionId, {
           ...newCreds,
           existingProviderSpecificData: credentials.providerSpecificData,
           testStatus: "active"
-        });
+        }, { refreshedFrom });
+        return storedTokensIfStale(stored, newCreds, credentials.providerSpecificData);
+      },
+      onRefreshTokenRejected: async (failure, refreshToken) => {
+        refreshTokenRejected = await markRefreshTokenRejected(provider, credentials, failure, refreshToken);
       },
       onRequestSuccess: async () => {
         await clearAccountError(credentials.connectionId, credentials, model);
@@ -326,6 +336,16 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     });
 
     if (result.success) return result.response;
+
+    if (refreshTokenRejected) {
+      // The 401 came from a login whose grant is gone: it is marked for re-login,
+      // so skip the cooldown and move on.
+      excludeConnectionIds.add(credentials.connectionId);
+      lastError = result.error;
+      lastStatus = result.status;
+      lastHeaders = upstreamResponseHeaders(result.response?.headers);
+      continue;
+    }
 
     // Antigravity 409/429: refresh live quota to get exact resetAt before locking
     let quotaResetMs = null;

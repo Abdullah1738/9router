@@ -1,7 +1,9 @@
 import { getProviderConnections, updateProviderConnection } from "@/lib/localDb.js";
 import { getExecutor } from "open-sse/index.js";
+import { storedTokensIfStale } from "@/sse/services/tokenRefresh";
 
-async function persistRefreshedCredentials(connection, newCredentials) {
+// `refreshedFrom` is the refresh token the new credentials were made with.
+async function persistRefreshedCredentials(connection, newCredentials, refreshedFrom) {
   const updateData = {};
 
   if (newCredentials.accessToken) updateData.accessToken = newCredentials.accessToken;
@@ -27,9 +29,9 @@ async function persistRefreshedCredentials(connection, newCredentials) {
     };
   }
 
-  if (Object.keys(updateData).length > 0) {
-    await updateProviderConnection(connection.id, updateData);
-  }
+  if (Object.keys(updateData).length === 0) return null;
+  const stored = await updateProviderConnection(connection.id, updateData, { refreshedFrom });
+  return storedTokensIfStale(stored, newCredentials);
 }
 
 export async function POST(request) {
@@ -66,10 +68,13 @@ export async function POST(request) {
 
     // Auto-refresh token on 401/403 and retry (same as chatCore.js)
     if (response.status === 401 || response.status === 403) {
+      const refreshedFrom = credentials.refreshToken;
       const newCredentials = await executor.refreshCredentials(credentials, console);
       if (newCredentials?.accessToken || newCredentials?.copilotToken) {
         Object.assign(credentials, newCredentials);
-        await persistRefreshedCredentials(connection, newCredentials);
+        const stale = await persistRefreshedCredentials(connection, newCredentials, newCredentials.refreshedFrom || refreshedFrom);
+        // A refresh that lost a race to newer stored tokens retries with those instead.
+        if (stale) Object.assign(credentials, stale);
         ({ response } = await executor.execute({ model, body, stream, credentials }));
       }
     }

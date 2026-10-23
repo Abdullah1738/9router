@@ -191,6 +191,8 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
     log.info("AUTH", `\x1b[32mUsing ${providerId} account: ${credentials.connectionName}\x1b[0m`);
 
     const refreshedCredentials = await checkAndRefreshToken(providerId, credentials);
+    // The core rotates credentials in place before calling back; keep the token it refreshes with.
+    const refreshedFrom = refreshedCredentials.refreshToken;
 
     const result = await handleFetchCore({
       url: targetUrl,
@@ -206,7 +208,7 @@ async function handleSingleProviderFetch(body, providerInput, request, apiKey, s
           refreshToken: newCreds.refreshToken,
           providerSpecificData: newCreds.providerSpecificData,
           testStatus: "active"
-        });
+        }, { refreshedFrom: newCreds.refreshedFrom || refreshedFrom });
       }
     });
 

@@ -78,10 +78,44 @@ describe("refreshAccessToken — config-driven profiles", () => {
     expect(parsed).not.toHaveProperty("client_secret");
   });
 
-  it("returns null on non-ok response", async () => {
-    mockFetchOnce({ error: "invalid_grant" }, { ok: false, status: 400 });
+  it("returns null on a transient non-ok response", async () => {
+    mockFetchOnce({ error: "server_error" }, { ok: false, status: 503 });
     const { refreshAccessToken } = await import("open-sse/services/tokenRefresh/providers.js");
-    const out = await refreshAccessToken("iflow", "dead", {}, console);
+    const out = await refreshAccessToken("iflow", "flaky", {}, console);
+    expect(out).toBeNull();
+  });
+
+  it("flags an expired refresh token as unrecoverable", async () => {
+    mockFetchOnce(
+      { error: "invalid_grant", error_description: "Refresh token expired" },
+      { ok: false, status: 400 },
+    );
+    const { refreshAccessToken } = await import("open-sse/services/tokenRefresh/providers.js");
+    const { isUnrecoverableRefreshError } = await import("open-sse/services/tokenRefresh.js");
+    const out = await refreshAccessToken("claude", "dead", {}, console);
+    expect(out).toEqual({ error: "unrecoverable_refresh_error", code: "invalid_grant" });
+    expect(isUnrecoverableRefreshError(out)).toBe(true);
+  });
+
+  it("only treats an exact rejection code on a 400/401 as permanent", async () => {
+    const { getPermanentRefreshRejection } = await import("open-sse/services/tokenRefresh/providers.js");
+    const body = (o) => JSON.stringify(o);
+
+    expect(getPermanentRefreshRejection(400, body({ error: "invalid_grant" }))).toBe("invalid_grant");
+    expect(getPermanentRefreshRejection(401, body({ error: { code: "refresh_token_reused" } }))).toBe("refresh_token_reused");
+    // Upstream outage whose text happens to mention the marker
+    expect(getPermanentRefreshRejection(503, body({ error: "invalid_grant" }))).toBeNull();
+    // Other error code, marker only in the description
+    expect(getPermanentRefreshRejection(400, body({ error: "invalid_request", error_description: "not an invalid_grant" }))).toBeNull();
+    // Non-JSON body
+    expect(getPermanentRefreshRejection(400, "invalid_grant")).toBeNull();
+    expect(getPermanentRefreshRejection(400, "")).toBeNull();
+  });
+
+  it("returns null for a 5xx even when the body says invalid_grant", async () => {
+    mockFetchOnce({ error: "invalid_grant" }, { ok: false, status: 502 });
+    const { refreshAccessToken } = await import("open-sse/services/tokenRefresh/providers.js");
+    const out = await refreshAccessToken("claude", "maybe-dead", {}, console);
     expect(out).toBeNull();
   });
 

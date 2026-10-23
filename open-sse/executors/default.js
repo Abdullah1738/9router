@@ -9,6 +9,14 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
 import { extractClaudeSessionIdFromUserId } from "../utils/claudeCloaking.js";
+import { getPermanentRefreshRejection } from "../services/tokenRefresh/providers.js";
+
+// Same shape the proactive refresh path returns, so the caller can take a login
+// whose grant is gone out of rotation instead of cooling it down and retrying.
+async function refreshRejection(response) {
+  const code = getPermanentRefreshRejection(response.status, await response.text().catch(() => ""));
+  return code ? { error: "unrecoverable_refresh_error", code } : null;
+}
 
 // Auth header descriptors — derived from registry transport.auth, fallback to hardcoded defaults.
 const BEARER = { combined: true, header: "Authorization", scheme: "bearer" };
@@ -262,7 +270,7 @@ export class DefaultExecutor extends BaseExecutor {
 
     try {
       const result = await refresher();
-      if (result) log?.info?.("TOKEN", `${this.provider} refreshed`);
+      if (result && !result.error) log?.info?.("TOKEN", `${this.provider} refreshed`);
       return result;
     } catch (error) {
       log?.error?.("TOKEN", `${this.provider} refresh error: ${error.message}`);
@@ -276,7 +284,7 @@ export class DefaultExecutor extends BaseExecutor {
       headers: { "Content-Type": "application/json", "Accept": "application/json" },
       body: JSON.stringify(body)
     }, proxyOptions);
-    if (!response.ok) return null;
+    if (!response.ok) return refreshRejection(response);
     const tokens = await response.json();
     return { accessToken: tokens.access_token, refreshToken: tokens.refresh_token || body.refresh_token, expiresIn: tokens.expires_in };
   }
@@ -287,7 +295,7 @@ export class DefaultExecutor extends BaseExecutor {
       headers: { "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json" },
       body: new URLSearchParams(params)
     }, proxyOptions);
-    if (!response.ok) return null;
+    if (!response.ok) return refreshRejection(response);
     const tokens = await response.json();
     return { accessToken: tokens.access_token, refreshToken: tokens.refresh_token || params.refresh_token, expiresIn: tokens.expires_in };
   }
@@ -348,7 +356,7 @@ export class DefaultExecutor extends BaseExecutor {
       },
       body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: cfg.clientId })
     }, proxyOptions);
-    if (!response.ok) return null;
+    if (!response.ok) return refreshRejection(response);
     const tokens = await response.json();
     return { accessToken: tokens.access_token, refreshToken: tokens.refresh_token || refreshToken, expiresIn: tokens.expires_in };
   }

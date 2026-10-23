@@ -1,6 +1,6 @@
 // Re-export from open-sse with local logger
 import * as log from "../utils/logger.js";
-import { getProviderConnectionById, updateProviderConnection } from "../../lib/localDb.js";
+import { getProviderConnectionById, updateProviderConnection, markConnectionReauthRequired } from "../../lib/localDb.js";
 import {
   getProjectIdForConnection,
   invalidateProjectId,
@@ -20,7 +20,8 @@ import {
   formatProviderCredentials as _formatProviderCredentials,
   getAllAccessTokens as _getAllAccessTokens,
   refreshKiroToken as _refreshKiroToken,
-  getRefreshLeadMs as _getRefreshLeadMs
+  getRefreshLeadMs as _getRefreshLeadMs,
+  isUnrecoverableRefreshError as _isUnrecoverableRefreshError
 } from "open-sse/services/tokenRefresh.js";
 import {
   refreshProviderCredentials as _refreshProviderCredentials,
@@ -92,6 +93,49 @@ export function releaseConnection(connectionId) {
  * @param {number} expiresIn
  * @returns {string}
  */
+// Proxy/relay fields getProviderCredentials resolves onto the request's credentials;
+// a stored row only has the raw config (e.g. proxyPoolId), not these.
+const RESOLVED_TRANSPORT_FIELDS = [
+  "connectionProxyEnabled",
+  "connectionProxyUrl",
+  "connectionNoProxy",
+  "connectionProxyPoolId",
+  "vercelRelayUrl",
+];
+
+function withResolvedTransport(storedData, currentData) {
+  const merged = { ...(storedData || currentData || {}) };
+  for (const key of RESOLVED_TRANSPORT_FIELDS) {
+    if (currentData && Object.hasOwn(currentData, key)) merged[key] = currentData[key];
+  }
+  return merged;
+}
+
+/**
+ * A refresh that lost a race to newer tokens is not written (see refreshedFrom), so the
+ * caller must not keep using what it got back. Returns the stored tokens in that case.
+ * @returns {object|null} tokens to use instead, or null when the refresh was stored
+ */
+export function storedTokensIfStale(stored, refreshed, currentData) {
+  if (!stored?.accessToken || !refreshed?.accessToken) return null;
+  if (stored.accessToken === refreshed.accessToken) return null;
+  return storedRequestCredentials(stored, currentData);
+}
+
+// The stored row in request-credential shape. GitHub sends the top-level copilotToken
+// as its bearer, so it has to follow the row too (null drops the losing one).
+function storedRequestCredentials(stored, currentData) {
+  return {
+    accessToken: stored.accessToken,
+    refreshToken: stored.refreshToken,
+    expiresAt: stored.expiresAt,
+    lastRefreshAt: stored.lastRefreshAt,
+    copilotToken: stored.providerSpecificData?.copilotToken || null,
+    copilotTokenExpiresAt: stored.providerSpecificData?.copilotTokenExpiresAt || null,
+    providerSpecificData: withResolvedTransport(stored.providerSpecificData, currentData),
+  };
+}
+
 function toExpiresAt(expiresIn) {
   return new Date(Date.now() + expiresIn * 1000).toISOString();
 }
@@ -158,9 +202,10 @@ function _refreshProjectId(provider, connectionId, accessToken) {
  *
  * @param {string} connectionId
  * @param {object} newCredentials
- * @returns {Promise<boolean>}
+ * @param {{ refreshedFrom?: string }} [options]  refresh token the new credentials were made with
+ * @returns {Promise<object|null>} the stored connection; it keeps its own tokens when the write was stale
  */
-export async function updateProviderCredentials(connectionId, newCredentials) {
+export async function updateProviderCredentials(connectionId, newCredentials, { refreshedFrom = null } = {}) {
   try {
     const updates = {};
 
@@ -194,19 +239,39 @@ export async function updateProviderCredentials(connectionId, newCredentials) {
     }
     if (newCredentials.projectId)            updates.projectId = newCredentials.projectId;
 
-    const result = await updateProviderConnection(connectionId, updates);
+    const result = await updateProviderConnection(connectionId, updates, { refreshedFrom });
     log.info("TOKEN_REFRESH", "Credentials updated in localDb", {
       connectionId,
       success: !!result
     });
-    return !!result;
+    return result || null;
   } catch (error) {
     log.error("TOKEN_REFRESH", "Error updating credentials in localDb", {
       connectionId,
       error: error.message,
     });
-    return false;
+    return null;
   }
+}
+
+/**
+ * Take a login out of rotation when a refresh came back permanently rejected.
+ * `refreshToken` is the token the failed refresh used; if the row has moved on
+ * to another one, nothing is marked. Logs once, when the mark is first set.
+ *
+ * @returns {Promise<boolean>} true when the connection is (now or already) marked
+ */
+export async function markRefreshTokenRejected(provider, credentials, refreshResult, refreshToken) {
+  const connectionId = credentials?.connectionId || credentials?.id;
+  if (!connectionId || !_isUnrecoverableRefreshError(refreshResult)) return false;
+
+  const { changed, connection } = await markConnectionReauthRequired(connectionId, { refreshToken })
+    .catch(() => ({ changed: false, connection: null }));
+  if (changed) {
+    const name = connection.displayName || connection.name || connection.email || connectionId.slice(0, 8);
+    log.warn("AUTH", `${provider} | ${name} needs re-login (refresh token rejected: ${refreshResult.code || refreshResult.error}), out of rotation until it logs in again`);
+  }
+  return !!connection?.reauthRequiredAt;
 }
 
 // ─── Local-specific: proactive token refresh ─────────────────────────────────
@@ -262,6 +327,11 @@ export async function checkAndRefreshToken(provider, credentials, options = {}) 
     });
 
     const newCreds = await _refreshProviderCredentials(provider, creds, log);
+    // The refresh may have been one already running for an older token.
+    const refreshedFrom = newCreds?.refreshedFrom || creds.refreshToken;
+    if (await markRefreshTokenRejected(provider, creds, newCreds, refreshedFrom)) {
+      creds.needsRelogin = true;
+    }
     if (newCreds?.accessToken || newCreds?.apiKey || newCreds?.copilotToken) {
       const mergedCreds = {
         ...newCreds,
@@ -269,18 +339,25 @@ export async function checkAndRefreshToken(provider, credentials, options = {}) 
       };
 
       // Persist to DB (non-blocking path continues below)
-      await updateProviderCredentials(creds.connectionId, mergedCreds);
+      const stored = await updateProviderCredentials(creds.connectionId, mergedCreds, { refreshedFrom });
 
-      creds = {
-        ...creds,
-        ...newCreds,
-        expiresAt: newCreds.expiresIn
-          ? toExpiresAt(newCreds.expiresIn)
-          : normalizeExpiresAt(newCreds.expiresAt) || newCreds.expiresAt || creds.expiresAt,
-        providerSpecificData: newCreds.providerSpecificData
-          ? { ...creds.providerSpecificData, ...newCreds.providerSpecificData }
-          : creds.providerSpecificData,
-      };
+      if (stored && newCreds.accessToken && stored.accessToken !== newCreds.accessToken) {
+        // The write was stale (the row moved on to newer tokens): use what the row holds.
+        creds = { ...creds, ...storedRequestCredentials(stored, creds.providerSpecificData) };
+        if (stored.reauthRequiredAt) creds.needsRelogin = true;
+      } else {
+        creds = {
+          ...creds,
+          ...newCreds,
+          expiresAt: newCreds.expiresIn
+            ? toExpiresAt(newCreds.expiresIn)
+            : normalizeExpiresAt(newCreds.expiresAt) || newCreds.expiresAt || creds.expiresAt,
+          providerSpecificData: newCreds.providerSpecificData
+            ? { ...creds.providerSpecificData, ...newCreds.providerSpecificData }
+            : creds.providerSpecificData,
+        };
+      }
+      delete creds.refreshedFrom;
 
       // Non-blocking: refresh projectId with the new access token
       _refreshProjectId(provider, creds.connectionId, creds.accessToken);

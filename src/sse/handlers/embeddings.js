@@ -12,7 +12,7 @@ import { handleEmbeddingsCore } from "open-sse/handlers/embeddingsCore.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import * as log from "../utils/logger.js";
-import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
+import { updateProviderCredentials, checkAndRefreshToken, storedTokensIfStale } from "../services/tokenRefresh.js";
 import { saveRequestUsage } from "@/lib/usageDb.js";
 
 function exactEmbeddingUsage(raw) {
@@ -121,6 +121,8 @@ export async function handleEmbeddings(request) {
     log.info("AUTH", `\x1b[32mUsing ${provider} account: ${credentials.connectionName}\x1b[0m`);
 
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
+    // The core rotates credentials in place before calling back; keep the token it refreshes with.
+    const refreshedFrom = refreshedCredentials.refreshToken;
 
     const result = await handleEmbeddingsCore({
       body: { ...body, model: `${provider}/${model}` },
@@ -128,11 +130,12 @@ export async function handleEmbeddings(request) {
       credentials: refreshedCredentials,
       log,
       onCredentialsRefreshed: async (newCreds) => {
-        await updateProviderCredentials(credentials.connectionId, {
+        const stored = await updateProviderCredentials(credentials.connectionId, {
           ...newCreds,
           existingProviderSpecificData: credentials.providerSpecificData,
           testStatus: "active"
-        });
+        }, { refreshedFrom: newCreds.refreshedFrom || refreshedFrom });
+        return storedTokensIfStale(stored, newCreds, credentials.providerSpecificData);
       },
       onRequestSuccess: async () => {
         await clearAccountError(credentials.connectionId, credentials, model);

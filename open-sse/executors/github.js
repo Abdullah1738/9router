@@ -8,6 +8,8 @@ import { initState, translateRequest, translateResponse } from "../translator/in
 import { FORMATS } from "../translator/formats.js";
 import { parseSSELine, formatSSE } from "../utils/streamHelpers.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
+import { getPermanentRefreshRejection } from "../services/tokenRefresh/providers.js";
+import { isUnrecoverableRefreshError } from "../services/tokenRefresh.js";
 import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
 import { SSE_DONE } from "../utils/sseConstants.js";
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
@@ -382,7 +384,10 @@ export class GithubExecutor extends BaseExecutor {
         headers: { "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json" },
         body: new URLSearchParams(params)
       }, proxyOptions);
-      if (!response.ok) return null;
+      if (!response.ok) {
+        const code = getPermanentRefreshRejection(response.status, await response.text().catch(() => ""));
+        return code ? { error: "unrecoverable_refresh_error", code } : null;
+      }
       const tokens = await response.json();
       log?.info?.("TOKEN", "GitHub token refreshed");
       return { accessToken: tokens.access_token, refreshToken: tokens.refresh_token || refreshToken, expiresIn: tokens.expires_in };
@@ -397,6 +402,8 @@ export class GithubExecutor extends BaseExecutor {
 
     if (!copilotResult && credentials.refreshToken) {
       const githubTokens = await this.refreshGitHubToken(credentials.refreshToken, log, proxyOptions);
+      // A dead grant goes back to the caller so it can take the login out of rotation.
+      if (isUnrecoverableRefreshError(githubTokens)) return githubTokens;
       if (githubTokens?.accessToken) {
         copilotResult = await this.refreshCopilotToken(githubTokens.accessToken, log, proxyOptions);
         if (copilotResult) {

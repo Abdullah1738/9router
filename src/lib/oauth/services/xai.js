@@ -168,7 +168,8 @@ export class XaiService extends OAuthService {
     });
     if (!res.ok) {
       const err = await res.text();
-      throw new Error(`xAI token refresh failed: ${err}`);
+      // Status and body let the caller tell a dead grant from an outage.
+      throw Object.assign(new Error(`xAI token refresh failed: ${err}`), { status: res.status, body: err });
     }
     return await res.json();
   }

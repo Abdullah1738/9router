@@ -19,6 +19,7 @@ import {
   refreshWindsurfToken,
   refreshMiniMaxCodeToken,
   classifyOAuthRefreshError,
+  isPermanentRefreshCode,
 } from "./tokenRefresh/providers.js";
 
 // Re-export all provider refresh functions (preserves public API for all consumers)
@@ -40,6 +41,7 @@ export {
   refreshWindsurfToken,
   refreshMiniMaxCodeToken,
   classifyOAuthRefreshError,
+  isPermanentRefreshCode,
 };
 
 export const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000;

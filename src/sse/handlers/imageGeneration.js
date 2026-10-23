@@ -11,7 +11,7 @@ import { getKeyAccessContext, enforceKeyAccess } from "../services/keyAccess.js"
 import { handleImageGenerationCore } from "open-sse/handlers/imageGenerationCore.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
-import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
+import { updateProviderCredentials, checkAndRefreshToken, storedTokensIfStale } from "../services/tokenRefresh.js";
 import { handleComboChat } from "open-sse/services/combo.js";
 import * as log from "../utils/logger.js";
 import { saveRequestUsage } from "@/lib/usageDb.js";
@@ -132,6 +132,8 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
     }
 
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
+    // The core rotates credentials in place before calling back; keep the token it refreshes with.
+    const refreshedFrom = refreshedCredentials.refreshToken;
 
     const result = await handleImageGenerationCore({
       body,
@@ -140,12 +142,13 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
       streamToClient: wantsStream,
       binaryOutput,
       onCredentialsRefreshed: async (newCreds) => {
-        await updateProviderCredentials(credentials.connectionId, {
+        const stored = await updateProviderCredentials(credentials.connectionId, {
           accessToken: newCreds.accessToken,
           refreshToken: newCreds.refreshToken,
           providerSpecificData: newCreds.providerSpecificData,
           testStatus: "active"
-        });
+        }, { refreshedFrom: newCreds.refreshedFrom || refreshedFrom });
+        return storedTokensIfStale(stored, newCreds, credentials.providerSpecificData);
       },
       onUsage: (usage) => {
         recordImageRequestUsage({
