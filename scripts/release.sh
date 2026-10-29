@@ -17,7 +17,7 @@ set -euo pipefail
 SELF=$0
 
 usage() {
-  sed -n '2,11p' "$SELF" | sed 's/^# \{0,1\}//'
+  awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$SELF"
 }
 
 approved=0 dry=0 nobuild=0 mode=switch
@@ -44,15 +44,19 @@ act() {
   if (( dry )); then echo "DRY: $*"; else "$@"; fi
 }
 
+# hup: ask the supervisor to reload. Nonzero when launchctl could not deliver the signal.
 hup() {
-  act launchctl kill SIGHUP gui/$(id -u)/$LABEL
-  (( dry )) || echo "SIGHUP sent; watch: tail -f $LOG | grep 9r-"
+  if (( dry )); then echo "DRY: launchctl kill SIGHUP gui/$(id -u)/$LABEL"; return 0; fi
+  launchctl kill SIGHUP gui/$(id -u)/$LABEL || return 1
+  echo "SIGHUP sent; watch: tail -f $LOG | grep 9r-"
 }
 
 log_size() { stat -f %z "$LOG" 2>/dev/null || echo 0; }
 
-# wait_serving <release-dir> <log-offset>: 0 once the supervisor logs serving for that release.
-# 1 on "reload failed" or after 150 s with no answer.
+# wait_serving <release-dir> <log-offset>
+# 0 = supervisor logged serving for that release.
+# 1 = supervisor logged "reload failed": the old worker kept serving.
+# 2 = no answer within 150 s: outcome unknown (new worker may be up, log may have rotated).
 wait_serving() {
   local rel=$1 off=$2 chunk deadline=$(( SECONDS + 150 ))
   if (( dry )); then echo "DRY: wait up to 150 s in $LOG from byte $off for 'serving; release $rel'"; return 0; fi
@@ -66,6 +70,18 @@ wait_serving() {
     sleep 3
   done
   echo "supervisor: no answer after 150 s"
+  return 2
+}
+
+# reload_to <release-dir>: reload and confirm the supervisor serves that release; one retry on a missed answer.
+reload_to() {
+  local rel=$1 off attempt rc
+  for attempt in 1 2; do
+    off=$(log_size)
+    hup || return 1
+    rc=0; wait_serving "$rel" "$off" || rc=$?
+    if (( rc == 0 )); then return 0; fi
+  done
   return 1
 }
 
@@ -89,13 +105,12 @@ act mkdir -p $REL
 if [[ $mode == rollback ]]; then
   prev=$(readlink $REL/previous 2>/dev/null) || { echo "no previous release"; exit 1; }
   cur=$(readlink $REL/current)
-  off=$(log_size)
   act ln -sfn $prev $REL/current
   act ln -sfn $cur $REL/previous
   echo "current -> $prev"
-  hup
-  wait_serving "$REL/$prev" "$off" || echo "rollback reload did not confirm serving; check $LOG"
-  exit 0
+  if reload_to "$REL/$prev"; then echo "rollback confirmed: serving $prev"; exit 0; fi
+  echo "rollback reload NOT confirmed; check $LOG"
+  exit 1
 fi
 
 if (( nobuild == 0 )); then
@@ -122,46 +137,60 @@ fi
 
 prev_cur=$(readlink $REL/current 2>/dev/null || true)
 prev_prev=$(readlink $REL/previous 2>/dev/null || true)
-off=$(log_size)
 
-if [[ -L $REL/current ]]; then act ln -sfn $prev_cur $REL/previous; fi
-act ln -sfn $id $REL/current
-echo "current -> $id"
-hup
-
-# Reloading failed or never answered: point back at the old release. The old worker kept serving.
+# Put current/previous back exactly as they were before this switch.
 restore_pointers() {
-  if [[ -n $prev_cur ]]; then act ln -sfn $prev_cur $REL/current; fi
+  if [[ -n $prev_cur ]]; then act ln -sfn $prev_cur $REL/current; else act rm -f $REL/current; fi
   if [[ -n $prev_prev ]]; then act ln -sfn $prev_prev $REL/previous; else act rm -f $REL/previous; fi
 }
 
-if ! wait_serving "$REL/$id" "$off"; then
-  restore_pointers
-  echo "Switch to $id failed; kept the previous release."
-  exit 1
-fi
-
-# Rollback: swap back to the previous release and reload. Alert, then exit 1.
+# Rollback: point current back at the previous release, reload, confirm, alert, exit 1.
 roll_back() {
   local reason=$1
   echo "Rolling back $id: $reason"
   if [[ -z $prev_cur ]]; then
-    echo "No previous release to roll back to; current left at $id."
+    echo "No previous release to roll back to; $id stays live."
+    notify "$reason (no previous release)"
+    exit 1
+  fi
+  act ln -sfn $prev_cur $REL/current
+  act ln -sfn $id $REL/previous
+  echo "current -> $prev_cur"
+  if reload_to "$REL/$prev_cur"; then
+    echo "rollback confirmed: serving $prev_cur"
   else
-    local roff=$(log_size)
-    act ln -sfn $prev_cur $REL/current
-    act ln -sfn $id $REL/previous
-    echo "current -> $prev_cur"
-    hup
-    wait_serving "$REL/$prev_cur" "$roff" || echo "rollback reload did not confirm serving; check $LOG"
+    echo "rollback reload NOT confirmed; check $LOG"
   fi
   notify "$reason"
   exit 1
 }
 
+if [[ -n $prev_cur ]]; then act ln -sfn $prev_cur $REL/previous; fi
+act ln -sfn $id $REL/current
+echo "current -> $id"
+off=$(log_size)
+
+if ! hup; then
+  restore_pointers
+  echo "SIGHUP failed; supervisor was not asked to reload, pointers restored, previous release kept."
+  exit 1
+fi
+
+rc=0; wait_serving "$REL/$id" "$off" || rc=$?
+if (( rc == 1 )); then
+  restore_pointers
+  echo "Switch to $id failed; supervisor kept the previous release serving."
+  exit 1
+fi
+if (( rc == 2 )); then
+  roll_back "switch to $id not confirmed within 150 s"
+fi
+
 if (( dry )); then
   echo "DRY: skipped canary: node scripts/release-canary.mjs"
   echo "DRY: skipped watch: node scripts/release-watch.mjs --log $LOG --offset $off --minutes ${WATCH_MINUTES:-5}"
+  echo "DRY: preview of the rollback a failed canary or watch runs:"
+  ( roll_back "canary failed or error burst (dry-run preview)" ) || true
 else
   node scripts/release-canary.mjs || roll_back "canary failed (real model call)"
 
@@ -169,7 +198,7 @@ else
   watch_out=$(node scripts/release-watch.mjs --log "$LOG" --offset "$off" --minutes "${WATCH_MINUTES:-5}" 2>&1) || watch_rc=$?
   echo "$watch_out"
   if (( watch_rc == 3 )); then roll_back "error burst: $watch_out"; fi
-  if (( watch_rc != 0 )); then roll_back "watch exited $watch_rc"; fi
+  if (( watch_rc != 0 )); then roll_back "watch failed (exit $watch_rc): $watch_out"; fi
 fi
 
 # Keep the five newest releases plus the live pair.
