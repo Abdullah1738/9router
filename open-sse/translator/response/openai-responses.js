@@ -679,12 +679,21 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
       state.error = error;
       state.finishReasonSent = true;
 
-      // Surface the error as an OpenAI-compatible error chunk
-      return buildChunk(
+      const message = error.message || JSON.stringify(error);
+      const chunk = buildChunk(
         { id: state.chatId || `chatcmpl-${Date.now()}`, created: state.created || Math.floor(Date.now() / 1000), model: state.model || MODEL_FALLBACK },
-        { content: `[Error] ${error.message || JSON.stringify(error)}` },
+        { content: `[Error] ${message}` },
         OPENAI_FINISH.STOP
       );
+      // The text keeps content-only clients (Claude/Gemini format) seeing the error as before.
+      // The error key makes OpenAI-format clients (OpenCode, openai-python) fail the request
+      // instead of taking a 0-token reply as an answer, so OpenCode can compact on overflow.
+      chunk.error = {
+        message,
+        type: typeof error.type === "string" ? error.type : "upstream_error",
+        code: error.code ?? null,
+      };
+      return chunk;
     }
     return null;
   }

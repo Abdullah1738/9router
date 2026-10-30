@@ -429,6 +429,11 @@ exports[`GOLDEN response stream: OpenAI-Responses (codex) → OpenAI > error eve
       },
     ],
     "created": 0,
+    "error": {
+      "code": null,
+      "message": "model_not_found",
+      "type": "upstream_error",
+    },
     "id": "chatcmpl-<TS>",
     "model": "unknown",
     "object": "chat.completion.chunk",
