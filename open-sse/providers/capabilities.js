@@ -126,6 +126,9 @@ export const MODEL_CAPABILITIES = {
   "claude-sonnet-4-6": { vision: true, pdf: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 },
   // Sonnet 5.5 rejects thinking.type "disabled" (use "between_tools") and forced tool_choice (any/tool).
   "claude-sonnet-5-5": { vision: true, pdf: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000, thinkingOffType: "between_tools", forcedToolChoice: false },
+  // Haiku 5.5: 1M window, adaptive effort (owner, 31 Oct). Provider rows (commandcode,
+  // opencode-go, github) still win for their own lanes.
+  "claude-haiku-5-5": { vision: true, pdf: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 64000 },
   "claude-sonnet-5-5-thinking": { vision: true, pdf: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000, thinkingOffType: "between_tools", forcedToolChoice: false },
   "claude-sonnet-5-5-high": { vision: true, pdf: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000, thinkingOffType: "between_tools", forcedToolChoice: false },
   "claude-sonnet-5-5-medium": { vision: true, pdf: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000, thinkingOffType: "between_tools", forcedToolChoice: false },
@@ -311,6 +314,8 @@ export const PROVIDER_CAPABILITIES = {
     "gpt-6-astra[1m]":           CODEX_EXTENDED_CAPS,
     "gpt-6-sol[1m]":             CODEX_EXTENDED_CAPS,
     "gpt-6-luna[1m]":            CODEX_EXTENDED_CAPS,
+    "gpt-6.1-sol[1m]":           CODEX_EXTENDED_CAPS,
+    "gpt-6.1-terra[1m]":         CODEX_EXTENDED_CAPS,
     "gpt-5.6-sol[1m]":           CODEX_EXTENDED_CAPS,
     "gpt-5.6-terra[1m]":         CODEX_EXTENDED_CAPS,
     "gpt-5.6-luna[1m]":          CODEX_EXTENDED_CAPS,
