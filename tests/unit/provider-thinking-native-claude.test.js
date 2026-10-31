@@ -137,6 +137,32 @@ describe("provider thinking on native Claude requests", () => {
     expect(body).not.toHaveProperty("output_config");
   });
 
+  it.each(["on", "off"])("never sends effort %s when the client already set thinking (Claude)", async (mode) => {
+    const body = await runClaude({
+      providerThinking: { mode },
+      body: { model: "claude-opus-5-5", max_tokens: 64, thinking: { type: "adaptive" }, messages: [{ role: "user", content: "Reply OK." }] },
+    });
+
+    expect(body.thinking).toEqual({ type: "adaptive" });
+    expect(body.output_config?.effort).toBeUndefined();
+    expect(body).not.toHaveProperty("reasoning_effort");
+  });
+
+  it.each(["on", "off"])("never sends reasoning.effort %s when the client already set thinking (Responses)", async (mode) => {
+    const body = await runClaude({
+      provider: "codex",
+      model: "gpt-6.1-sol",
+      sourceFormatOverride: "openai-responses",
+      endpoint: "/v1/responses",
+      providerThinking: { mode },
+      body: { model: "gpt-6.1-sol", input: "hello", stream: false, thinking: { type: "adaptive" } },
+      headers: { "user-agent": "codex_cli_rs/0.166.0" },
+    });
+
+    expect(body.reasoning?.effort).toBeUndefined();
+    expect(body).not.toHaveProperty("reasoning_effort");
+  });
+
   it("skips the custom prompt when the token-saver header is off", async () => {
     const withHeader = await runClaude({
       customPromptEnabled: true,

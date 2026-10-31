@@ -117,11 +117,16 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
   if (providerThinking?.mode && providerThinking.mode !== "auto") {
     const mode = providerThinking.mode;
-    if (mode === "on" && !body.thinking) {
-      console.log("Injecting provider-level thinking config override: on");
-      body = { ...body, thinking: { type: "enabled", budget_tokens: 10000 } };
-    } else if (mode === "off" && !body.thinking) {
-      body = { ...body, thinking: { type: "disabled" } };
+    if (mode === "on" || mode === "off") {
+      // on/off only ever touch body.thinking; they never become an effort value.
+      if (!body.thinking) {
+        if (mode === "on") {
+          console.log("Injecting provider-level thinking config override: on");
+          body = { ...body, thinking: { type: "enabled", budget_tokens: 10000 } };
+        } else {
+          body = { ...body, thinking: { type: "disabled" } };
+        }
+      }
     } else if (sourceFormat === FORMATS.CLAUDE) {
       // Claude's effort field is output_config.effort; top-level reasoning_effort is a 400 on native Claude.
       if (!body.output_config?.effort && !body.reasoning_effort && body.thinking?.type !== "disabled") {
