@@ -126,7 +126,7 @@ describe("reactive refresh after an upstream 401", () => {
 describe("storedTokensIfStale", () => {
   it("hands back the row's tokens only when the write was dropped", async () => {
     const { storedTokensIfStale } = await import("../../src/sse/services/tokenRefresh.js");
-    const resolved = { connectionProxyEnabled: true, connectionProxyUrl: "http://proxy:1" };
+    const resolved = { connectionProxyEnabled: true, connectionProxyUrl: "http://proxy:1", strictProxy: true };
 
     expect(storedTokensIfStale(null, { accessToken: "a" })).toBeNull();
     expect(storedTokensIfStale({ accessToken: "a" }, { accessToken: "a" })).toBeNull();
@@ -136,6 +136,7 @@ describe("storedTokensIfStale", () => {
       resolved,
     )).toEqual({
       accessToken: "at-row",
+      apiKey: undefined,
       refreshToken: "rt-row",
       expiresAt: "x",
       lastRefreshAt: undefined,
@@ -143,6 +144,21 @@ describe("storedTokensIfStale", () => {
       copilotTokenExpiresAt: null,
       providerSpecificData: { region: "eu", ...resolved },
     });
+  });
+
+  it("keeps strict proxy mode and the winning row's apiKey when adopting a stale refresh", async () => {
+    const { storedTokensIfStale } = await import("../../src/sse/services/tokenRefresh.js");
+    const { DefaultExecutor } = await import("../../open-sse/executors/default.js");
+    const resolved = { connectionProxyEnabled: true, connectionProxyUrl: "http://proxy:1", strictProxy: true };
+    const adopted = storedTokensIfStale(
+      { accessToken: "at-row", apiKey: "nous-key-row", refreshToken: "rt-row", providerSpecificData: { proxyPoolId: "pool-1" } },
+      { accessToken: "at-mine", apiKey: "nous-key-mine" },
+      resolved,
+    );
+
+    expect(adopted.providerSpecificData).toMatchObject({ strictProxy: true, connectionProxyUrl: "http://proxy:1" });
+    expect(adopted.apiKey).toBe("nous-key-row");
+    expect(new DefaultExecutor("nous").buildHeaders(adopted).Authorization).toBe("Bearer nous-key-row");
   });
 
   it("sends GitHub's stored Copilot bearer on the retry, not the losing one", async () => {

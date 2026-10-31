@@ -105,6 +105,7 @@ const RESOLVED_TRANSPORT_FIELDS = [
   "connectionNoProxy",
   "connectionProxyPoolId",
   "vercelRelayUrl",
+  "strictProxy",
 ];
 
 function withResolvedTransport(storedData, currentData) {
@@ -131,6 +132,8 @@ export function storedTokensIfStale(stored, refreshed, currentData) {
 function storedRequestCredentials(stored, currentData) {
   return {
     accessToken: stored.accessToken,
+    // Nous mints an apiKey with every refresh and the executor prefers it, so the winning row's key must follow.
+    apiKey: stored.apiKey,
     refreshToken: stored.refreshToken,
     expiresAt: stored.expiresAt,
     lastRefreshAt: stored.lastRefreshAt,
