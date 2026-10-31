@@ -44,7 +44,8 @@ beforeEach(() => {
 it("uses the real persisted refresh service before sending expired-account OAuth audio", async () => {
   const response = await POST(request());
   expect(response.status).toBe(200);
-  expect(mocks.update).toHaveBeenCalledWith("offline-connection", expect.objectContaining({ accessToken: "offline-refreshed-token", refreshToken: "offline-rotated-refresh", providerSpecificData: { workspaceId: "workspace", customMetadata: "preserve-me", chatgptAccountId: "account" } }));
+  // The write also carries the refresh token it was made with (fork: stale-write guard, refreshedFrom).
+  expect(mocks.update).toHaveBeenCalledWith("offline-connection", expect.objectContaining({ accessToken: "offline-refreshed-token", refreshToken: "offline-rotated-refresh", providerSpecificData: { workspaceId: "workspace", customMetadata: "preserve-me", chatgptAccountId: "account" } }), { refreshedFrom: "offline-refresh" });
   expect(mocks.httpsRequest.mock.calls[0][1].headers.Authorization).toBe("Bearer offline-refreshed-token");
   expect(mocks.httpsRequest.mock.calls[0][1].headers["ChatGPT-Account-Id"]).toBe("workspace");
   expect(mocks.update.mock.invocationCallOrder[0]).toBeLessThan(mocks.httpsRequest.mock.invocationCallOrder[0]);
