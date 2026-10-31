@@ -26,7 +26,9 @@ function request() {
   return new Request("http://localhost/v1/audio/transcriptions", { method: "POST", body: form });
 }
 beforeEach(() => {
-  vi.clearAllMocks(); mocks.latest.mockResolvedValue(null); mocks.update.mockResolvedValue({ id: credentials.connectionId });
+  vi.clearAllMocks(); mocks.latest.mockResolvedValue(null);
+  // The row a write leaves behind: the stale-write guard in tokenRefresh.js compares its accessToken with the refreshed one.
+  mocks.update.mockImplementation(async (_id, row) => ({ id: credentials.connectionId, ...row }));
   mocks.refresh.mockResolvedValue({ accessToken: "offline-refreshed-token", refreshToken: "offline-rotated-refresh", expiresIn: 3600, providerSpecificData: { chatgptAccountId: "account" }, lastRefreshAt: new Date().toISOString() });
   mocks.fetch.mockImplementation(async () => Response.json({ text: "persisted" }));
   mocks.httpsRequest.mockImplementation((_url, options, callback) => {
