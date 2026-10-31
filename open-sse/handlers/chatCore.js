@@ -122,6 +122,15 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       body = { ...body, thinking: { type: "enabled", budget_tokens: 10000 } };
     } else if (mode === "off" && !body.thinking) {
       body = { ...body, thinking: { type: "disabled" } };
+    } else if (sourceFormat === FORMATS.CLAUDE) {
+      // Claude's effort field is output_config.effort; top-level reasoning_effort is a 400 on native Claude.
+      if (!body.output_config?.effort && !body.reasoning_effort && body.thinking?.type !== "disabled") {
+        body = { ...body, output_config: { ...(body.output_config || {}), effort: mode } };
+      }
+    } else if (sourceFormat === FORMATS.OPENAI_RESPONSES) {
+      if (!body.reasoning?.effort) {
+        body = { ...body, reasoning: { ...(body.reasoning || {}), effort: mode } };
+      }
     } else if (!body.reasoning_effort) {
       body = { ...body, reasoning_effort: mode };
     }
@@ -213,7 +222,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       }
     }
     // Normalize newer Cowork/CC beta shapes (adaptive thinking, mid-conversation system) the API rejects
-    if (clientTool === "claude") normalizeClaudePassthrough(translatedBody, translatedBody.model);
+    if (clientTool === "claude") {
+      // Anthropic rejects top-level reasoning_effort on native passthrough (400); effort lives in output_config.
+      delete translatedBody.reasoning_effort;
+      normalizeClaudePassthrough(translatedBody, translatedBody.model);
+    }
   } else {
     translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool);
     if (!translatedBody) {
@@ -311,14 +324,14 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     xf.push(`PONYTAIL:${ponytailLevel}`);
   }
 
-  // Custom prompt: user-authored instruction, independent of the savers above
-  if (customPromptEnabled && injectCustomPrompt(translatedBody, finalFormat, customPrompt)) {
+  // Custom prompt: user-authored instruction, gated by the same token-saver header as the savers above
+  if (tokenSaverEnabled && customPromptEnabled && injectCustomPrompt(translatedBody, finalFormat, customPrompt)) {
     xf.push(`CUSTOMPROMPT:${customPrompt.trim().length}c`);
   }
 
   // PXPIPE: image bulky context (Claude-format bodies only), last saver before dispatch
   let pxpipeSummary = null;
-  if (pxpipeEnabled) {
+  if (tokenSaverEnabled && pxpipeEnabled) {
     const pxpipeResult = await compressWithPxpipe(translatedBody, {
       enabled: true, format: finalFormat, model: upstreamModel,
       minChars: pxpipeMinChars, timeoutMs: pxpipeTimeoutMs, transform: pxpipeTransform,
@@ -329,6 +342,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     try { onPxpipeEvent?.({ provider, model, ...pxpipeSummary }); } catch { /* stats must not break requests */ }
   }
 
+  if (!tokenSaverEnabled) xf.push("SAVERS:off");
   if (xf.length && log?.line) log.line(reqTag, "⚙", xf.join(" · "));
 
   // Pin cache breakpoints to the final body — every saver above can reshape
