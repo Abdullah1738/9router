@@ -142,6 +142,7 @@ describe("Nous route wiring (API key + OAuth)", () => {
     expect(mocks.updateProviderConnection).toHaveBeenCalledWith(
       "nous-connection",
       expect.objectContaining({ testStatus: "active", lastError: null }),
+      { refreshedFrom: null },
     );
   });
 
