@@ -132,8 +132,15 @@ async function fetchClaudeUsageRaw(accessToken, proxyOptions = null) {
         }
       }
 
+      // "none" only on an explicit five_hour: null (Anthropic lifted the 5h
+      // limit). A missing key or a malformed window is not proof of a lift.
+      const fiveHourLimit = Object.prototype.hasOwnProperty.call(data, "five_hour")
+        ? (data.five_hour === null ? "none" : hasUtilization(data.five_hour) ? "limited" : "unknown")
+        : "unknown";
+
       return {
         plan: "Claude Code",
+        fiveHourLimit,
         extraUsage: data.extra_usage ?? null,
         resetCredits: parseClaudeResetGrants(data.cedar_ember),
         quotas,

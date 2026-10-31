@@ -89,6 +89,21 @@ export function ingestClaudeUsage(connectionId, usage) {
   const s = quotas["session (5h)"];
   const w = quotas["weekly (7d)"];
   if (!s && !w) return false;
+  // A usage poll only reports the account-wide windows, so it must not erase an
+  // unexpired model-scoped rejection that came from response headers.
+  const scopedRejected = Boolean(r.status === "rejected" && r.claim
+    && !ACCOUNT_WIDE_CLAIMS.has(r.claim) && r.resetAt > Date.now());
+  // Anthropic lifted the 5h limit (explicit five_hour: null): drop the stale 5h
+  // reading and a five_hour rejection, which would otherwise hold until the old reset.
+  if (usage.fiveHourLimit === "none") {
+    r.u5 = null;
+    r.r5 = null;
+    r.s5 = null;
+    if (r.claim === "five_hour") {
+      r.claim = null;
+      r.resetAt = null;
+    }
+  }
   if (s) {
     r.u5 = (Number(s.used) || 0) / 100;
     r.r5 = s.resetAt ? Date.parse(s.resetAt) || null : null;
@@ -99,7 +114,8 @@ export function ingestClaudeUsage(connectionId, usage) {
     r.r7 = w.resetAt ? Date.parse(w.resetAt) || null : null;
     r.s7 = r.u7 >= 1 ? "rejected" : "allowed";
   }
-  r.status = r.s5 === "rejected" || r.s7 === "rejected" ? "rejected" : "allowed";
+  r.status = scopedRejected || r.s5 === "rejected" || r.s7 === "rejected"
+    ? "rejected" : "allowed";
   r.source = "usage";
   r.updatedAt = Date.now();
   r.authError = null;
