@@ -27,7 +27,7 @@ describe("Codex GPT-6 Sol/Luna transport", () => {
     expect(getThinkingLevels("codex", `${model}(high)`)).toEqual(entry.thinkingLevels);
   });
 
-  it("lists gpt-6.1-terra as a Lite model with its 500k Codex window", () => {
+  it("lists gpt-6.1-terra as a Lite model with its 1.05M window", () => {
     const entry = getModelsByProviderId("codex").find((item) => item.id === "gpt-6.1-terra");
     expect(entry?.responsesLite).toBe(true);
     expect(entry?.thinkingLevels).toEqual(["low", "medium", "high", "xhigh", "max"]);
@@ -36,7 +36,7 @@ describe("Codex GPT-6 Sol/Luna transport", () => {
       reasoning: true,
       search: true,
       thinkingFormat: "openai",
-      contextWindow: 500000,
+      contextWindow: 1050000,
       maxOutput: 128000,
     });
     expect(getPricingForModel("codex", "gpt-6.1-terra")).toMatchObject({ input: 1, cached: 0.05, cache_creation: 1.25, output: 5 });
