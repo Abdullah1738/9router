@@ -42,7 +42,23 @@ const CONTENTFUL_BLOCKS = new Set([
 function isContentfulBlock(block) {
   if (!block) return false;
   if (block.type === CLAUDE_BLOCK.TEXT) return !!block.text?.trim();
+  if (block.type === CLAUDE_BLOCK.THINKING) return !!String(block.thinking ?? "").trim();
+  if (block.type === CLAUDE_BLOCK.REDACTED_THINKING) return typeof block.data === "string" && block.data.length > 0;
   return CONTENTFUL_BLOCKS.has(block.type);
+}
+
+function isThinkingBlock(block) {
+  return block?.type === CLAUDE_BLOCK.THINKING || block?.type === CLAUDE_BLOCK.REDACTED_THINKING;
+}
+
+function isValidClaudeThinkingBlock(block) {
+  if (block.type === CLAUDE_BLOCK.THINKING) {
+    return !!String(block.thinking ?? "").trim() && isValidClaudeSignature(block.signature);
+  }
+  // RedactedThinkingBlockParam carries opaque `data`, not a `signature`.
+  // Only Anthropic can authenticate it; don't rewrite or interpret the data.
+  return typeof block.data === "string" && block.data.length > 0
+    && (block.signature === undefined || isValidClaudeSignature(block.signature));
 }
 
 export function hasValidContent(msg) {
@@ -57,12 +73,11 @@ export function hasValidContent(msg) {
 }
 // Content may arrive as a single content block object (spec allows string | array;
 // some clients send the bare object). Wrap it as a one-block array and strip any
-// client-placed cache_control: a bare-object marker must never survive
-// normalization, on any path, guard or no guard.
+// client-placed cache_control on cacheable blocks.
 function normalizeMessageContent(msg) {
   const c = msg?.content;
   if (c && typeof c === "object" && !Array.isArray(c)) {
-    delete c.cache_control;
+    if (!isThinkingBlock(c)) delete c.cache_control;
     msg.content = [c];
   }
   return msg;
@@ -101,7 +116,7 @@ function capCacheControlBlocks(body) {
   if (Array.isArray(body?.tools)) for (const t of body.tools) if (t?.cache_control) marked.push(t);
   if (Array.isArray(body?.messages)) {
     for (const m of body.messages) {
-      if (Array.isArray(m?.content)) for (const b of m.content) if (b?.cache_control) marked.push(b);
+      if (Array.isArray(m?.content)) for (const b of m.content) if (b?.cache_control && !isThinkingBlock(b)) marked.push(b);
     }
   }
   const head = marked.filter(isHead);
@@ -284,11 +299,13 @@ export function normalizeClaudePassthrough(body, model = "") {
     for (const msg of body.messages) {
       if (msg.role !== ROLE.ASSISTANT || !Array.isArray(msg.content)) continue;
       let hasToolUse = false;
+      let hadThinking = false;
       let hasKeptThinking = false;
       const kept = [];
       for (const block of msg.content) {
         if (block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING) {
-          if (isValidClaudeSignature(block.signature)) {
+          hadThinking = true;
+          if (isValidClaudeThinkingBlock(block)) {
             hasKeptThinking = true;
             kept.push(block);
           }
@@ -302,7 +319,7 @@ export function normalizeClaudePassthrough(body, model = "") {
         kept.push(block);
       }
       msg.content = kept;
-      if (thinkingEnabled && !hasKeptThinking && hasToolUse) {
+      if (thinkingEnabled && hadThinking && !hasKeptThinking && hasToolUse) {
         msg.content.unshift(buildThinkingPlaceholder("claude"));
       }
     }
@@ -441,7 +458,7 @@ export function anchorClaudeCache(body) {
     for (let i = body.messages.length - 1; i >= 0; i--) {
       const msg = body.messages[i];
       if (!Array.isArray(msg.content)) continue;
-      for (const block of msg.content) delete block.cache_control;
+      for (const block of msg.content) if (!isThinkingBlock(block)) delete block.cache_control;
 
       // Prefer the last assistant turn: it ends a completed exchange, so the
       // prefix up to it stays byte-stable across the following requests.
@@ -571,7 +588,7 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
       // Remove cache_control from content blocks
       if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
-          delete block.cache_control;
+          if (!isThinkingBlock(block)) delete block.cache_control;
         }
       }
 
@@ -624,6 +641,7 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
         // Handle thinking blocks for Anthropic-compatible endpoints.
         if (handlesThinkingBlocks(provider) || deepSeekServed) {
           let hasToolUse = false;
+          let hadThinking = false;
           let hasKeptThinking = false;
 
           // Claude native: preserve valid signatures, drop invalid blocks.
@@ -638,9 +656,10 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
           for (const block of msg.content) {
             const isThinking = block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING;
             if (isThinking) {
-              if (!String(block.thinking ?? "").trim()) continue;
+              hadThinking = true;
+              if (block.type === CLAUDE_BLOCK.THINKING && !String(block.thinking ?? "").trim()) continue;
               if (isClaudeNative) {
-                if (isValidClaudeSignature(block.signature)) {
+                if (isValidClaudeThinkingBlock(block)) {
                   hasKeptThinking = true;
                   kept.push(block);
                 }
@@ -660,12 +679,14 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
           msg.content = kept;
 
           // Add thinking block if thinking enabled + has tool_use but no thinking
-          if (thinkingEnabled && !hasKeptThinking && hasToolUse) {
+          if (thinkingEnabled && (hadThinking || !isClaudeNative) && !hasKeptThinking && hasToolUse) {
             msg.content.unshift(buildThinkingPlaceholder(provider, deepSeekServed));
           }
         }
       }
     }
+    // A thinking-only message may have become empty after the signature check.
+    body.messages = ensureTrailingUserTurn(filtered.filter(msg => !Array.isArray(msg.content) || msg.content.length > 0), originalLastRole);
   }
 
   // 3. Tools: filter built-in tools for non-Anthropic providers, then handle cache_control

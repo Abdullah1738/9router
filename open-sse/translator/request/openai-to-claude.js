@@ -290,10 +290,8 @@ function getContentBlocksFromMessage(msg, toolNameMap = new Map()) {
         } else if (part.type === CLAUDE_BLOCK.TOOL_USE) {
           // Tool name already has prefix from tool declarations, keep as-is
           blocks.push({ type: CLAUDE_BLOCK.TOOL_USE, id: part.id, name: part.name, input: part.input });
-        } else if (part.type === CLAUDE_BLOCK.THINKING) {
-          // Include thinking block but strip cache_control (not allowed on thinking blocks)
-          const { cache_control, ...thinkingBlock } = part;
-          blocks.push(thinkingBlock);
+        } else if (part.type === CLAUDE_BLOCK.THINKING || part.type === CLAUDE_BLOCK.REDACTED_THINKING) {
+          blocks.push(part);
         }
       }
     } else if (msg.content) {
@@ -410,4 +408,3 @@ export { openaiToClaudeRequestForAntigravity };
 
 // Register
 register(FORMATS.OPENAI, FORMATS.CLAUDE, openaiToClaudeRequest, null);
-

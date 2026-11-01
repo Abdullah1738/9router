@@ -193,7 +193,11 @@ export function getSessionKey(headers, body) {
   // carries a session (Claude Code style "..._session_<uuid>").
   const userId = typeof b.metadata?.user_id === "string" && b.metadata.user_id.includes("_session_")
     ? b.metadata.user_id : null;
-  for (const v of [b.prompt_cache_key, b.session_id, b.conversation_id, userId]) {
+  let jsonSessionId = null;
+  if (typeof b.metadata?.user_id === "string" && b.metadata.user_id.startsWith("{")) {
+    try { jsonSessionId = JSON.parse(b.metadata.user_id)?.session_id; } catch {}
+  }
+  for (const v of [b.prompt_cache_key, b.session_id, b.conversation_id, userId, jsonSessionId]) {
     if (typeof v === "string" && v.trim() && v.length <= 256) return v.trim();
   }
   return null;
@@ -238,21 +242,22 @@ function pruneSessions(now) {
  * Choose a connection from `available` (already filtered for DB locks/excludes,
  * sorted by priority). Returns { connection, reason }.
  */
-export function selectQuotaAware(available, sessionKey, now = Date.now()) {
+export function selectQuotaAware(available, sessionKey, now = Date.now(), options = {}) {
   if (!available?.length) return { connection: null, reason: "none" };
   const usable = available.filter((c) => !getQuotaLockUntil(c.id, now));
   const pool0 = usable.length ? usable : available;
   const eligible = pool0.filter((c) => fiveHourOk(c.id, now));
 
+  const sticky = sessionKey ? (Object.hasOwn(options, "sticky") ? options.sticky : state.sessions.get(sessionKey)) : null;
   if (sessionKey) {
-    const sticky = state.sessions.get(sessionKey);
     if (sticky && now - sticky.lastUsedAt < CFG.stickyIdleTtlMs) {
       const conn = usable.find((c) => c.id === sticky.connectionId);
-      // Stay unless the account is past the 5h threshold and somewhere else has room.
-      if (conn && (fiveHourOk(conn.id, now) || eligible.length === 0)) {
-        sticky.lastUsedAt = now;
+      if (conn) {
+        state.sessions.delete(sessionKey);
+        state.sessions.set(sessionKey, { connectionId: conn.id, lastUsedAt: now });
         return { connection: conn, reason: "sticky" };
       }
+      if (options.preserveUnavailableSticky) return { connection: null, reason: "sticky-unavailable" };
     }
   }
 
@@ -287,8 +292,20 @@ export function selectQuotaAware(available, sessionKey, now = Date.now()) {
     state.sessions.set(sessionKey, { connectionId: best.id, lastUsedAt: now });
     pruneSessions(now);
   }
-  const reason = reasonOverride || (usable.length ? (eligible.length ? "score" : "all-over-5h") : "all-quota-locked");
+  let reason = reasonOverride || (usable.length ? (eligible.length ? "score" : "all-over-5h") : "all-quota-locked");
+  if (sticky && now - sticky.lastUsedAt < CFG.stickyIdleTtlMs && best?.id !== sticky.connectionId) {
+    reason = `moved:${options.moveReason || "quota-locked"},${reason}`;
+  }
   return { connection: best, reason, score: bestScore };
+}
+
+export function hydrateClaudeSessions(entries, now = Date.now()) {
+  state.sessions.clear();
+  for (const [key, value] of entries) {
+    if (value && typeof value.connectionId === "string" && Number.isFinite(value.lastUsedAt)
+      && now - value.lastUsedAt < CFG.stickyIdleTtlMs) state.sessions.set(key, value);
+  }
+  pruneSessions(now);
 }
 
 export function getTrackerSnapshot(now = Date.now()) {

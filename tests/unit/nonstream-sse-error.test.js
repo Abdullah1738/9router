@@ -110,3 +110,19 @@ describe("non-streaming SSE errors", () => {
     expect((await result.response.json()).error.message).toBe("Invalid SSE response for non-streaming request");
   });
 });
+
+describe("Claude input transformation diagnostics", () => {
+  it("logs dropped thinking on a non-streaming response before translation", async () => {
+    const entries = [
+      { type: "thinking_dropped", path: "messages.1.content.0", reason: "model_binding_mismatch" },
+      { type: "thinking_dropped", path: "messages.3.content.0", reason: "model_binding_mismatch" },
+    ];
+    const raw = JSON.stringify({ id: "msg_1", type: "message", role: "assistant", model: "claude", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: { input_tokens: 2, output_tokens: 1 }, input_transformations: entries });
+    const ctx = context(raw, FORMATS.CLAUDE, "application/json");
+    Object.assign(ctx, { provider: "claude", targetFormat: FORMATS.CLAUDE, observeClaudeThinking: true, reqTag: "request-tag" });
+    const result = await handleNonStreamingResponse(ctx);
+    expect(result.success).toBe(true);
+    expect(ctx.log.line).toHaveBeenCalledWith("request-tag", "⚙", "THINKING dropped=2 reasons=model_binding_mismatch:2");
+    expect((await result.response.json()).input_transformations).toEqual(entries);
+  });
+});

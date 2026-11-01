@@ -11,6 +11,9 @@ export async function register() {
     const { startModelCatalogSync } = await import("@/lib/modelCatalog/sync.js");
     startModelCatalogSync();
 
+    const { loadClaudeStickySessions } = await import("@/sse/services/claudeSticky.js");
+    await loadClaudeStickySessions();
+
     // Quota-aware Claude routing needs fresh quota state even when no
     // dashboard page has been opened (initializeApp runs from the layout).
     import("@/shared/services/claudeQuotaPoller")

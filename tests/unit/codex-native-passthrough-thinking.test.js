@@ -35,10 +35,10 @@ vi.mock("../../open-sse/handlers/chatCore/sseToJsonHandler.js", () => ({
 
 const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
 
-async function runNativeCodexRequest(model, reasoning) {
+async function runNativeCodexRequest(model, reasoning, input = "hello") {
   const body = {
     model,
-    input: "hello",
+    input,
     stream: false,
     ...(reasoning ? { reasoning } : {}),
   };
@@ -107,5 +107,17 @@ describe("native Codex passthrough thinking suffixes", () => {
 
     expect(body.model).toBe("gpt-5.6-terra");
     expect(body.reasoning).toEqual({ effort: "ultra" });
+  });
+
+  it("passes encrypted reasoning items through to the Codex executor unchanged", async () => {
+    const input = [
+      { role: "user", content: [{ type: "input_text", text: "hello" }] },
+      { type: "reasoning", id: "rs_1", summary: [{ type: "summary_text", text: "summary" }], encrypted_content: "opaque-encrypted-content" },
+      { type: "function_call", call_id: "call_1", name: "shell", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_1", output: "ok" },
+    ];
+    const expected = JSON.stringify(input);
+    const body = await runNativeCodexRequest("gpt-5.6-terra", undefined, input);
+    expect(JSON.stringify(body.input)).toBe(expected);
   });
 });

@@ -76,7 +76,8 @@ function stripStoredItemReferences(body, preserveLitePrefix = false) {
     if (typeof item === "string" && SERVER_ID_PATTERN.test(item)) return false;
     if (item && typeof item === "object" && !Array.isArray(item)) {
       if (item.type === "item_reference") return false;
-      if (typeof item.id === "string" && SERVER_ID_PATTERN.test(item.id)
+      if (!(item.type === "reasoning" && typeof item.encrypted_content === "string" && item.encrypted_content)
+        && typeof item.id === "string" && SERVER_ID_PATTERN.test(item.id)
         && !(preserveLitePrefix && item.role === "developer" && item.id.startsWith("msg_"))) delete item.id;
     }
     return true;

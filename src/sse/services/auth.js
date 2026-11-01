@@ -3,7 +3,8 @@ import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/con
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil, getModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { QUOTA_AWARE_STRATEGY } from "open-sse/config/claudeQuotaRouting.js";
-import { getQuotaLockUntil, getRejectionInfo, selectQuotaAware } from "open-sse/services/claudeQuotaTracker.js";
+import { getQuotaLockUntil, getRejectionInfo } from "open-sse/services/claudeQuotaTracker.js";
+import { selectPersistentClaudeAccount } from "./claudeSticky.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache, getAntigravityModelQuota } from "./antigravityQuota.js";
 import * as log from "../utils/logger.js";
@@ -184,9 +185,22 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // connections are pay-per-token and only used when no OAuth account is left.
       const oauthConnections = availableConnections.filter(c => c.authType === "oauth");
       const pick = oauthConnections.length
-        ? selectQuotaAware(oauthConnections, sessionKey)
+        ? await selectPersistentClaudeAccount({
+          available: oauthConnections,
+          sessionKey,
+          classifyUnavailable: (id) => {
+            const active = activeConnections.find((c) => c.id === id);
+            if (!active || active.reauthRequiredAt) return "disabled";
+            if (quotaLockUntil(active) || isModelLockActive(active, model)) return "quota-locked";
+            return "excluded";
+          },
+        })
         : { connection: availableConnections[0], reason: "no-oauth" };
-      connection = pick.connection || availableConnections[0];
+      if (!pick.connection) {
+        log.warn("AUTH", `${provider} | quota-aware: ${pick.reason}`);
+        return null;
+      }
+      connection = pick.connection;
       log.info("AUTH", `${provider} | quota-aware -> ${connection.displayName || connection.name || connection.email || connection.id?.slice(0, 8)} (${pick.reason}${sessionKey ? "" : ", no session key"})`);
     } else if (strategy === "round-robin") {
       const stickyLimit = providerOverride.stickyRoundRobinLimit || settings.stickyRoundRobinLimit || 3;

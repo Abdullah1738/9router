@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import "../translator/registerAll.js";
+import signatures from "../fixtures/claude-thinking-signatures.json";
 
 const { executeMock, forcedSSEToJsonMock } = vi.hoisted(() => ({
   executeMock: vi.fn(),
@@ -83,6 +84,29 @@ describe("provider thinking on native Claude requests", () => {
       success: true,
       response: new Response("{}", { status: 200 }),
     });
+  });
+
+  it.each([
+    ["native", { "user-agent": CLAUDE_CLI_UA }],
+    ["translated", { "user-agent": "generic-client/1.0" }],
+  ])("forwards real thinking blocks to the executor on the %s path", async (_, headers) => {
+    const blocks = [
+      { signature: signatures[0], type: "thinking", thinking: "reasoned" },
+      { type: "redacted_thinking", data: "opaque data" },
+    ];
+    const source = {
+      model: "claude-opus-5-5", max_tokens: 128, thinking: { type: "adaptive" },
+      messages: [
+        { role: "user", content: "first" },
+        { role: "assistant", content: [...blocks, { type: "tool_use", id: "toolu_1", name: "lookup", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] },
+      ],
+    };
+    const expected = JSON.stringify(blocks);
+    const sent = await runClaude({ body: source, headers });
+    const sentBlocks = sent.messages.flatMap((message) => Array.isArray(message.content) ? message.content : [])
+      .filter((block) => block.type === "thinking" || block.type === "redacted_thinking");
+    expect(JSON.stringify(sentBlocks)).toBe(expected);
   });
 
   it("sets output_config.effort and never top-level reasoning_effort on a Claude CLI request", async () => {
