@@ -39,9 +39,11 @@ export function detectClientTool(headers = {}, body = {}) {
   if (ua.includes("gemini-cli")) return "gemini-cli";
 
   // Codex CLI/Desktop — codex-tui is the current Rust CLI, codex-cli/codex_cli_rs legacy;
-  // Codex Desktop identifies via UA "Codex Desktop" or originator "codex_work_desktop"
+  // Codex Desktop identifies via UA "Codex Desktop" or originator "codex_work_desktop".
+  // Robob's Codex app-server sets both its originator and UA product to "T3 Code".
   if (ua.includes("codex-tui") || ua.includes("codex-cli") || ua.includes("codex_cli_rs") ||
-      ua.includes("codex desktop") || originator.startsWith("codex_")) return "codex";
+      ua.includes("codex desktop") || originator.startsWith("codex_") ||
+      (originator === "t3 code" && ua.startsWith("t3 code/"))) return "codex";
 
   // DeepSeek TUI
   if (ua.includes("deepseek-tui")) return "deepseek-tui";

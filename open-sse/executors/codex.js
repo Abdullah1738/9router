@@ -13,6 +13,7 @@ import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry } from "../config/
 import { dbg } from "../utils/debugLog.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { stripCodexUnsupportedPatterns } from "../utils/codexToolSchema.js";
+import { detectClientTool, isNativePassthrough } from "../utils/clientDetector.js";
 
 // SSE error patterns inside 200-OK bodies. Some retry same account first; capacity rotates accounts.
 const CODEX_SSE_RETRY_PATTERNS = ["server_is_overloaded", "service_unavailable_error"];
@@ -20,8 +21,14 @@ const CODEX_SSE_ACCOUNT_FALLBACK_PATTERNS = ["selected model is at capacity", "m
 const CODEX_SSE_USER_OUTPUT_PATTERNS = [
   "event: response.output_text.delta",
   "event: response.function_call_arguments.delta",
+  "event: response.reasoning_summary_text.delta",
+  "event: response.reasoning_summary_part.added",
+  "event: response.image_generation_call.",
   '"type":"response.output_text.delta"',
   '"type":"response.function_call_arguments.delta"',
+  '"type":"response.reasoning_summary_text.delta"',
+  '"type":"response.reasoning_summary_part.added"',
+  '"type":"response.image_generation_call.',
 ];
 const CODEX_SSE_PEEK_BYTES = 256 * 1024;
 const CODEX_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different model.";
@@ -56,7 +63,7 @@ const CODEX_PASSTHROUGH_TOOL_TYPES = new Set(["custom"]);
 const RESPONSES_API_ALLOWLIST = new Set([
   "model", "input", "instructions", "tools", "tool_choice", "stream", "store",
   "reasoning", "service_tier", "include", "prompt_cache_key", "client_metadata",
-  "text", "parallel_tool_calls"
+  "text", "parallel_tool_calls", "stream_options"
 ]);
 
 // Convert role=system → role=developer in body.input (keeps content in cacheable prefix)
@@ -85,9 +92,24 @@ function stripStoredItemReferences(body, preserveLitePrefix = false) {
 }
 
 // Flatten Chat-Completions tool shape into Responses flat format + filter unsupported tools
-function normalizeCodexTools(body) {
-  if (!Array.isArray(body.tools)) return;
+function normalizeCodexTools(body, nativeCodex = false) {
   const validNames = new Set();
+  if (nativeCodex && Array.isArray(body.input)) {
+    for (const item of body.input) {
+      if (item?.type !== "additional_tools" || !Array.isArray(item.tools)) continue;
+      for (const tool of item.tools) {
+        const names = tool?.type === "namespace" && Array.isArray(tool.tools) ? tool.tools : [tool];
+        for (const candidate of names) {
+          const name = typeof candidate?.name === "string" ? candidate.name.trim() : "";
+          if (name) validNames.add(name);
+        }
+      }
+    }
+  }
+  if (!Array.isArray(body.tools)) {
+    if (nativeCodex && body.tool_choice?.type === "function" && !validNames.has(body.tool_choice.name?.trim?.())) delete body.tool_choice;
+    return;
+  }
   // Codex's schema validator has no Unicode property escapes; a `pattern`
   // carrying `\p{...}` 400s the whole request on every account (#3922).
   const patternStats = { removed: 0 };
@@ -108,6 +130,7 @@ function normalizeCodexTools(body) {
     }
     if (type !== "function") {
       if (CODEX_PASSTHROUGH_TOOL_TYPES.has(type)) return true;
+      if (nativeCodex && type === "image_generation") return true;
       if (!type || tool.function || typeof tool.name === "string") return false;
       return CODEX_HOSTED_TOOL_TYPES.has(type);
     }
@@ -120,6 +143,13 @@ function normalizeCodexTools(body) {
       ? tool.parameters
       : (fn?.parameters && typeof fn.parameters === "object" && !Array.isArray(fn.parameters) ? fn.parameters : { type: "object", properties: {} });
     const strict = typeof tool.strict === "boolean" ? tool.strict : fn?.strict;
+    // Native flat function definitions may carry Responses fields such as
+    // output_schema or defer_loading that a Chat-completions adapter cannot reconstruct.
+    if (nativeCodex && !fn) {
+      tool.parameters = stripCodexUnsupportedPatterns(parameters, patternStats);
+      validNames.add(name);
+      return true;
+    }
     for (const k of Object.keys(tool)) delete tool[k];
     tool.type = "function";
     tool.name = name.slice(0, 128);
@@ -429,6 +459,7 @@ export class CodexExecutor extends BaseExecutor {
    * Image fetching is handled separately in prefetchImages() so this stays sync.
    */
   transformRequest(model, body, stream, credentials) {
+    const nativeCodex = isNativePassthrough(detectClientTool(credentials?.rawHeaders || {}, body), "codex");
     this._isCompact = !!body._compact;
     delete body._compact;
     // Resolve conversation-stable session_id (priority: body → assistant-text → workspace → machine)
@@ -480,7 +511,7 @@ export class CodexExecutor extends BaseExecutor {
     // Strip server-generated item IDs (rs_/fc_/resp_/msg_) — Codex /responses can't resolve when store=false
     stripStoredItemReferences(body, responsesLite);
     // Flatten function tools + drop unsupported types
-    normalizeCodexTools(body);
+    normalizeCodexTools(body, nativeCodex);
 
     // Ensure streaming is enabled (Codex API requires it)
     body.stream = true;
@@ -513,6 +544,10 @@ export class CodexExecutor extends BaseExecutor {
           prefix.push({ type: "message", role: "developer", content: [{ type: "input_text", text: instructions }] });
         }
         input.unshift(...prefix);
+      } else if (nativeCodex && Array.isArray(body.tools) && body.tools.length > 0) {
+        // Preserve existing prefix entries and append separately supplied tools.
+        input.splice(input.findIndex((item) => item?.type === "additional_tools") + 1, 0,
+          { type: "additional_tools", role: "developer", tools: body.tools });
       }
       body.input = input;
       body.instructions = "";
@@ -557,7 +592,11 @@ export class CodexExecutor extends BaseExecutor {
 
     // Include reasoning encrypted content (required by Codex backend for reasoning models)
     if (body.reasoning && body.reasoning.effort && body.reasoning.effort !== 'none') {
-      body.include = ["reasoning.encrypted_content"];
+      body.include = nativeCodex
+        ? [...new Set([...(Array.isArray(body.include) ? body.include : []), "reasoning.encrypted_content"])]
+        : ["reasoning.encrypted_content"];
+    } else if (nativeCodex && Array.isArray(body.include)) {
+      body.include = [...new Set(body.include)];
     }
 
     // Remove unsupported parameters for Codex API
@@ -575,7 +614,7 @@ export class CodexExecutor extends BaseExecutor {
     delete body.user; // Cursor sends this but Codex doesn't support it
     delete body.prompt_cache_retention; // Cursor sends this but Codex doesn't support it
     delete body.metadata; // Cursor sends this but Codex doesn't support it
-    delete body.stream_options; // Cursor sends this but Codex doesn't support it
+    if (!nativeCodex) delete body.stream_options; // Cursor sends incompatible options
     delete body.safety_identifier; // Droid CLI sends this but Codex doesn't support it
     delete body.previous_response_id; // store=false → backend can't resolve previous resp; avoid 404
 
