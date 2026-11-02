@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { getAdapter } from "@/lib/db/driver.js";
 import { CLAUDE_QUOTA_ROUTING as CFG } from "open-sse/config/claudeQuotaRouting.js";
-import { getQuotaLockUntil, hydrateClaudeSessions, selectQuotaAware } from "open-sse/services/claudeQuotaTracker.js";
+import { getQuotaLockUntil, hydrateClaudeSessions, rememberClaudeSession, selectQuotaAware } from "open-sse/services/claudeQuotaTracker.js";
 
 const SCOPE = "claudeSticky";
 const PREFIX = "claudeSticky:";
@@ -27,8 +27,8 @@ export async function loadClaudeStickySessions(now = Date.now()) {
   hydrateClaudeSessions(rows.map((row) => [row.key, parseRecord(row.value, now)]), now);
 }
 
-export async function selectPersistentClaudeAccount({ available, sessionKey, classifyUnavailable, now = Date.now() }) {
-  if (!sessionKey) return selectQuotaAware(available, null, now);
+export async function selectPersistentClaudeAccount({ available, sessionKey, classifyUnavailable, selectNew, now = Date.now() }) {
+  if (!sessionKey) return selectNew ? selectNew(available, now) : selectQuotaAware(available, null, now);
   const db = await getAdapter();
   const key = keyForSession(sessionKey);
   let selected;
@@ -43,13 +43,19 @@ export async function selectPersistentClaudeAccount({ available, sessionKey, cla
       : sticky && !available.some((c) => c.id === sticky.connectionId)
         ? (classifyUnavailable(sticky.connectionId) || "excluded") : null;
     const usable = available.filter((c) => !getQuotaLockUntil(c.id, now));
-    selected = sticky && unavailableReason && !usable.length
-      ? { connection: null, reason: "all-quota-locked" }
-      : selectQuotaAware(available, key, now, {
-        sticky,
-        preserveUnavailableSticky: Boolean(unavailableReason && !["quota-locked", "disabled"].includes(unavailableReason)),
-        moveReason: unavailableReason || "quota-locked",
-      });
+    const bound = sticky && usable.find((c) => c.id === sticky.connectionId);
+    if (bound) {
+      selected = { connection: bound, reason: "sticky" };
+    } else if (sticky && !["quota-locked", "disabled"].includes(unavailableReason)) {
+      selected = { connection: null, reason: "sticky-unavailable" };
+    } else if (!usable.length) {
+      selected = { connection: null, reason: "all-quota-locked" };
+    } else {
+      selected = selectNew ? selectNew(usable, now) : selectQuotaAware(usable, null, now);
+      if (sticky && selected.connection && selected.connection.id !== sticky.connectionId) {
+        selected = { ...selected, reason: `moved:${unavailableReason},${selected.reason}` };
+      }
+    }
     if (selected.connection) {
       db.run("INSERT INTO kv(scope, key, value) VALUES(?, ?, ?) ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value", [
         SCOPE, key, JSON.stringify({ connectionId: selected.connection.id, lastUsedAt: now }),
@@ -66,5 +72,6 @@ export async function selectPersistentClaudeAccount({ available, sessionKey, cla
     try { db.exec("ROLLBACK"); } catch {}
     throw error;
   }
+  if (selected.connection) rememberClaudeSession(key, selected.connection.id, now);
   return selected;
 }

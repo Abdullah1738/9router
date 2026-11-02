@@ -308,6 +308,12 @@ export function hydrateClaudeSessions(entries, now = Date.now()) {
   pruneSessions(now);
 }
 
+export function rememberClaudeSession(key, connectionId, now = Date.now()) {
+  state.sessions.delete(key);
+  state.sessions.set(key, { connectionId, lastUsedAt: now });
+  pruneSessions(now);
+}
+
 export function getTrackerSnapshot(now = Date.now()) {
   const accounts = [...state.accounts.values()].map((r) => ({
     ...r,

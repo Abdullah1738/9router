@@ -3,7 +3,7 @@ import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/con
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil, getModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { QUOTA_AWARE_STRATEGY } from "open-sse/config/claudeQuotaRouting.js";
-import { getQuotaLockUntil, getRejectionInfo } from "open-sse/services/claudeQuotaTracker.js";
+import { getQuotaLockUntil, getRejectionInfo, selectQuotaAware } from "open-sse/services/claudeQuotaTracker.js";
 import { selectPersistentClaudeAccount } from "./claudeSticky.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getAntigravityQuotaCache, getAntigravityModelQuota } from "./antigravityQuota.js";
@@ -171,8 +171,56 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       || settings.fallbackStrategy || "fill-first";
 
     let connection;
+    if (isClaude && sessionKey) {
+      const pick = await selectPersistentClaudeAccount({
+        available: availableConnections,
+        sessionKey,
+        classifyUnavailable: (id) => {
+          const active = activeConnections.find((c) => c.id === id);
+          if (!active || active.reauthRequiredAt) return "disabled";
+          if (quotaLockUntil(active) || (isModelLockActive(active, model) && Number(active.errorCode) === 429)) return "quota-locked";
+          return "excluded";
+        },
+        selectNew: (available, now) => {
+          const preferred = available.find((c) => c.id === preferredConnectionId);
+          if (preferred) return { connection: preferred, reason: "preferred" };
+          if (strategy === QUOTA_AWARE_STRATEGY) {
+            const oauth = available.filter((c) => c.authType === "oauth");
+            return oauth.length ? selectQuotaAware(oauth, null, now) : { connection: available[0], reason: "no-oauth" };
+          }
+          if (strategy === "round-robin") {
+            const byRecency = [...available].sort((a, b) => {
+              if (!a.lastUsedAt && !b.lastUsedAt) return (a.priority || 999) - (b.priority || 999);
+              if (!a.lastUsedAt) return 1;
+              if (!b.lastUsedAt) return -1;
+              return new Date(b.lastUsedAt) - new Date(a.lastUsedAt);
+            });
+            const current = byRecency[0];
+            const stickyLimit = providerOverride.stickyRoundRobinLimit || settings.stickyRoundRobinLimit || 3;
+            const keep = current?.lastUsedAt && (current.consecutiveUseCount || 0) < stickyLimit;
+            const next = keep ? current : [...available].sort((a, b) => {
+              if (!a.lastUsedAt && !b.lastUsedAt) return (a.priority || 999) - (b.priority || 999);
+              if (!a.lastUsedAt) return -1;
+              if (!b.lastUsedAt) return 1;
+              return new Date(a.lastUsedAt) - new Date(b.lastUsedAt);
+            })[0];
+            return { connection: next, reason: "round-robin", roundRobinCount: keep ? (next.consecutiveUseCount || 0) + 1 : 1 };
+          }
+          return { connection: available[0], reason: "fill-first" };
+        },
+      });
+      if (!pick.connection) {
+        log.warn("AUTH", `${provider} | affinity: ${pick.reason}`);
+        return null;
+      }
+      connection = pick.connection;
+      if (pick.roundRobinCount != null) {
+        await updateProviderConnection(connection.id, { lastUsedAt: new Date().toISOString(), consecutiveUseCount: pick.roundRobinCount });
+      }
+      log.info("AUTH", `${provider} | affinity -> ${connection.displayName || connection.name || connection.email || connection.id?.slice(0, 8)} (${pick.reason})`);
+    }
     // Pin to preferred connection if specified and available
-    if (preferredConnectionId) {
+    if (!connection && !(isClaude && sessionKey) && preferredConnectionId) {
       connection = availableConnections.find((c) => c.id === preferredConnectionId);
       if (connection) {
         log.info("AUTH", `${provider} | pinned to ${connection.id?.slice(0, 8)} (${connection.name || connection.email || "unnamed"})`);
@@ -185,16 +233,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // connections are pay-per-token and only used when no OAuth account is left.
       const oauthConnections = availableConnections.filter(c => c.authType === "oauth");
       const pick = oauthConnections.length
-        ? await selectPersistentClaudeAccount({
-          available: oauthConnections,
-          sessionKey,
-          classifyUnavailable: (id) => {
-            const active = activeConnections.find((c) => c.id === id);
-            if (!active || active.reauthRequiredAt) return "disabled";
-            if (quotaLockUntil(active) || isModelLockActive(active, model)) return "quota-locked";
-            return "excluded";
-          },
-        })
+        ? selectQuotaAware(oauthConnections, null)
         : { connection: availableConnections[0], reason: "no-oauth" };
       if (!pick.connection) {
         log.warn("AUTH", `${provider} | quota-aware: ${pick.reason}`);
