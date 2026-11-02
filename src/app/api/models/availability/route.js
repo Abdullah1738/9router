@@ -3,6 +3,7 @@ import {
   getProviderConnections,
   updateProviderConnection,
 } from "@/lib/localDb";
+import { getModelLockCauseKeyForLock } from "open-sse/services/accountFallback.js";
 
 const MODEL_LOCK_PREFIX = "modelLock_";
 
@@ -80,6 +81,7 @@ export async function POST(request) {
         .map((connection) =>
           updateProviderConnection(connection.id, {
             [lockKey]: null,
+            [getModelLockCauseKeyForLock(lockKey)]: null,
             ...(connection.testStatus === "unavailable"
               ? {
                   testStatus: "active",

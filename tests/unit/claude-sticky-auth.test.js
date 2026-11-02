@@ -13,7 +13,7 @@ vi.mock("@/sse/utils/logger.js", () => ({ debug: vi.fn(), info: (...args) => moc
 vi.mock("@/sse/services/antigravityQuota.js", () => ({ getAntigravityQuotaCache: () => new Map(), getAntigravityModelQuota: vi.fn() }));
 vi.mock("@/lib/db/driver.js", () => ({ getAdapter: async () => mock.db }));
 
-const { getProviderCredentials, markAccountUnavailable } = await import("@/sse/services/auth.js");
+const { getProviderCredentials, markAccountUnavailable, clearAccountError } = await import("@/sse/services/auth.js");
 const tracker = await import("open-sse/services/claudeQuotaTracker.js");
 const model = "claude-haiku-5-5";
 const options = { sessionKey: "test-session" };
@@ -35,6 +35,64 @@ beforeEach(() => {
 });
 
 describe("Claude affinity at credential selection", () => {
+  it.each([
+    [503, 429, false],
+    [429, 503, true],
+  ])("classifies a Haiku %s lock after a Sonnet %s lock by Haiku's cause", async (haikuStatus, sonnetStatus, shouldMove) => {
+    const first = await getProviderCredentials("claude", null, model, options);
+    await markAccountUnavailable(first.connectionId, haikuStatus, "test failure", "claude", model);
+    await markAccountUnavailable(first.connectionId, sonnetStatus, "test failure", "claude", "claude-sonnet-5-5");
+    const conn = mock.connections.find((c) => c.id === first.connectionId);
+    expect(conn.errorCode).toBe(sonnetStatus);
+    expect(tracker.getQuotaLockUntil(first.connectionId)).toBe(0);
+    const next = await getProviderCredentials("claude", new Set([first.connectionId]), model, options);
+    if (shouldMove) {
+      expect(next?.connectionId).not.toBe(first.connectionId);
+      expect(next?.connectionId).toBeTruthy();
+      expect(persisted().connectionId).toBe(next.connectionId);
+    } else {
+      expect(next).toBeNull();
+      expect(persisted().connectionId).toBe(first.connectionId);
+    }
+  });
+
+  it("uses the cause of an active account-wide lock and clears that cause on success", async () => {
+    const first = await getProviderCredentials("claude", null, model, options);
+    await markAccountUnavailable(first.connectionId, 429, "quota", "claude", null);
+    await markAccountUnavailable(first.connectionId, 503, "temporary", "claude", "claude-sonnet-5-5");
+    const next = await getProviderCredentials("claude", null, model, options);
+    expect(next?.connectionId).not.toBe(first.connectionId);
+    expect(persisted().connectionId).toBe(next.connectionId);
+    const conn = mock.connections.find((c) => c.id === first.connectionId);
+    await clearAccountError(first.connectionId, conn, model);
+    expect(conn.modelLock___all).toBeNull();
+    expect(conn.modelLockCause___all).toBeNull();
+    expect(conn["modelLockCause_claude-sonnet-5-5"]).toMatchObject({ status: 503 });
+  });
+
+  it("does not confuse expired or legacy lock causes with an active quota lock", async () => {
+    const first = await getProviderCredentials("claude", null, model, options);
+    const conn = mock.connections.find((c) => c.id === first.connectionId);
+    conn[`modelLock_${model}`] = new Date(Date.now() + 60_000).toISOString();
+    conn[`modelLockCause_${model}`] = { status: 429, until: new Date(Date.now() - 60_000).toISOString() };
+    conn.errorCode = 429;
+    expect(await getProviderCredentials("claude", null, model, options)).toBeNull();
+    expect(persisted().connectionId).toBe(first.connectionId);
+    delete conn[`modelLockCause_${model}`];
+    expect(await getProviderCredentials("claude", null, model, options)).toBeNull();
+    expect(persisted().connectionId).toBe(first.connectionId);
+  });
+
+  it("does not let an expired model lock hide an active account-wide quota lock", async () => {
+    const first = await getProviderCredentials("claude", null, model, options);
+    const conn = mock.connections.find((c) => c.id === first.connectionId);
+    conn[`modelLock_${model}`] = new Date(Date.now() - 60_000).toISOString();
+    await markAccountUnavailable(first.connectionId, 429, "quota", "claude", null);
+    const next = await getProviderCredentials("claude", null, model, options);
+    expect(next?.connectionId).toBeTruthy();
+    expect(next.connectionId).not.toBe(first.connectionId);
+  });
+
   it("retains the binding through a transient 503 cooldown and retry", async () => {
     const first = await getProviderCredentials("claude", null, model, options);
     await markAccountUnavailable(first.connectionId, 503, "temporary upstream failure", "claude", model);

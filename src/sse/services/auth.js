@@ -1,6 +1,6 @@
 import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools } from "@/lib/localDb";
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
-import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil, getModelLockUntil } from "open-sse/services/accountFallback.js";
+import { formatRetryAfter, checkFallbackError, isModelLockActive, isModelQuotaLocked, buildModelLockUpdate, getModelLockCauseKeyForLock, getEarliestModelLockUntil, getModelLockUntil } from "open-sse/services/accountFallback.js";
 import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { QUOTA_AWARE_STRATEGY } from "open-sse/config/claudeQuotaRouting.js";
 import { getQuotaLockUntil, getRejectionInfo, selectQuotaAware } from "open-sse/services/claudeQuotaTracker.js";
@@ -178,7 +178,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
         classifyUnavailable: (id) => {
           const active = activeConnections.find((c) => c.id === id);
           if (!active || active.reauthRequiredAt) return "disabled";
-          if (quotaLockUntil(active) || (isModelLockActive(active, model) && Number(active.errorCode) === 429)) return "quota-locked";
+          if (quotaLockUntil(active) || isModelQuotaLocked(active, model)) return "quota-locked";
           return "excluded";
         },
         selectNew: (available, now) => {
@@ -367,9 +367,11 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
     || (resolveProviderId(provider) === "claude" && status === 429 && resetsAtMs
       && getRejectionInfo(connectionId).accountWide);
   const lockUpdate = buildModelLockUpdate(accountWide ? null : model, cooldownMs);
+  const lockKey = Object.keys(lockUpdate)[0];
 
   await updateProviderConnection(connectionId, {
     ...lockUpdate,
+    [getModelLockCauseKeyForLock(lockKey)]: { status, until: lockUpdate[lockKey] },
     testStatus: "unavailable",
     lastError: reason,
     errorCode: status,
@@ -377,7 +379,6 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
     backoffLevel: newBackoffLevel ?? backoffLevel
   });
 
-  const lockKey = Object.keys(lockUpdate)[0];
   const connName = conn?.displayName || conn?.name || conn?.email || connectionId.slice(0, 8);
   log.warn("AUTH", `${connName} locked ${lockKey} for ${Math.round(cooldownMs / 1000)}s [${status}]`);
 
@@ -402,8 +403,9 @@ export async function clearAccountError(connectionId, currentConnection, model =
   const conn = currentConnection._connection || currentConnection;
   const now = Date.now();
   const allLockKeys = Object.keys(conn).filter(k => k.startsWith("modelLock_"));
+  const allCauseKeys = Object.keys(conn).filter(k => k.startsWith("modelLockCause_"));
 
-  if (!conn.testStatus && !conn.lastError && allLockKeys.length === 0) return;
+  if (!conn.testStatus && !conn.lastError && allLockKeys.length === 0 && allCauseKeys.length === 0) return;
 
   // Keys to clear: current model's lock + all expired locks
   const keysToClear = allLockKeys.filter(k => {
@@ -413,7 +415,11 @@ export async function clearAccountError(connectionId, currentConnection, model =
     return expiry && new Date(expiry).getTime() <= now;   // expired
   });
 
-  if (keysToClear.length === 0 && conn.testStatus !== "unavailable" && !conn.lastError) return;
+  const orphanCauses = allCauseKeys.filter(k => {
+    const lockKey = `modelLock_${k.slice("modelLockCause_".length)}`;
+    return !conn[lockKey] || new Date(conn[lockKey]).getTime() <= now;
+  });
+  if (keysToClear.length === 0 && orphanCauses.length === 0 && conn.testStatus !== "unavailable" && !conn.lastError) return;
 
   // Check if any active locks remain after clearing
   const remainingActiveLocks = allLockKeys.filter(k => {
@@ -423,6 +429,8 @@ export async function clearAccountError(connectionId, currentConnection, model =
   });
 
   const clearObj = Object.fromEntries(keysToClear.map(k => [k, null]));
+  for (const key of keysToClear) clearObj[getModelLockCauseKeyForLock(key)] = null;
+  for (const key of orphanCauses) clearObj[key] = null;
 
   // Only reset error state if no active locks remain
   if (remainingActiveLocks.length === 0) {

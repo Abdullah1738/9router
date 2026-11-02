@@ -22,6 +22,28 @@ afterEach(() => {
 });
 
 describe("Claude sticky SQLite storage", () => {
+  it("persists distinct lock causes per model and clears them on activation", async () => {
+    const repo = await import("@/lib/db/repos/connectionsRepo.js");
+    const { isModelQuotaLocked, getModelLockKey, getModelLockCauseKey } = await import("../../open-sse/services/accountFallback.js");
+    const conn = await repo.createProviderConnection({ provider: "claude", authType: "oauth", name: "test" });
+    const until = new Date(Date.now() + 60_000).toISOString();
+    await repo.updateProviderConnection(conn.id, {
+      [getModelLockKey("haiku")]: until,
+      [getModelLockCauseKey("haiku")]: { status: 429, until },
+      [getModelLockKey("sonnet")]: until,
+      [getModelLockCauseKey("sonnet")]: { status: 503, until },
+      errorCode: 503,
+    });
+    const stored = await repo.getProviderConnectionById(conn.id);
+    expect(isModelQuotaLocked(stored, "haiku")).toBe(true);
+    expect(isModelQuotaLocked(stored, "sonnet")).toBe(false);
+    await repo.updateProviderConnection(conn.id, { testStatus: "active" });
+    const activated = await repo.getProviderConnectionById(conn.id);
+    expect(activated[getModelLockKey("haiku")]).toBeNull();
+    expect(activated[getModelLockCauseKey("haiku")]).toBeNull();
+    expect(activated[getModelLockCauseKey("sonnet")]).toBeNull();
+  });
+
   it("reopens a persisted row after a restart and moves it after a quota lock", async () => {
     const { getAdapter } = await import("@/lib/db/driver.js");
     const tracker = await import("../../open-sse/services/claudeQuotaTracker.js");

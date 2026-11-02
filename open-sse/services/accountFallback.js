@@ -128,10 +128,31 @@ export const MODEL_LOCK_PREFIX = "modelLock_";
 
 /** Special key used when no model is known (account-level lock) */
 export const MODEL_LOCK_ALL = `${MODEL_LOCK_PREFIX}__all`;
+// Kept outside modelLock_ so existing lock enumeration only sees timestamps.
+export const MODEL_LOCK_CAUSE_PREFIX = "modelLockCause_";
 
 /** Build the flat field key for a model lock */
 export function getModelLockKey(model) {
   return model ? `${MODEL_LOCK_PREFIX}${model}` : MODEL_LOCK_ALL;
+}
+
+export function getModelLockCauseKey(model) {
+  return model ? `${MODEL_LOCK_CAUSE_PREFIX}${model}` : `${MODEL_LOCK_CAUSE_PREFIX}__all`;
+}
+
+export function getModelLockCauseKeyForLock(lockKey) {
+  return `${MODEL_LOCK_CAUSE_PREFIX}${lockKey.slice(MODEL_LOCK_PREFIX.length)}`;
+}
+
+// A cause is trusted only while its recorded deadline matches that same lock.
+// Old workers and imported records can overwrite a timestamp without its cause.
+export function isModelQuotaLocked(connection, model, now = Date.now()) {
+  const keys = [getModelLockKey(model), MODEL_LOCK_ALL];
+  return keys.some((key) => {
+    const until = connection?.[key];
+    const cause = connection?.[getModelLockCauseKeyForLock(key)];
+    return until && new Date(until).getTime() > now && cause?.until === until && Number(cause.status) === 429;
+  });
 }
 
 /**
@@ -139,10 +160,7 @@ export function getModelLockKey(model) {
  * Reads flat field `modelLock_${model}` (or `modelLock___all` when model=null).
  */
 export function isModelLockActive(connection, model) {
-  const key = getModelLockKey(model);
-  const expiry = connection[key] || connection[MODEL_LOCK_ALL];
-  if (!expiry) return false;
-  return new Date(expiry).getTime() > Date.now();
+  return Boolean(getModelLockUntil(connection, model));
 }
 
 /**
@@ -150,8 +168,10 @@ export function isModelLockActive(connection, model) {
  * Reads the same field isModelLockActive does.
  */
 export function getModelLockUntil(connection, model) {
-  if (!isModelLockActive(connection, model)) return null;
-  return connection[getModelLockKey(model)] || connection[MODEL_LOCK_ALL];
+  const now = Date.now();
+  const expiries = [connection?.[getModelLockKey(model)], connection?.[MODEL_LOCK_ALL]];
+  return expiries.filter((expiry) => expiry && new Date(expiry).getTime() > now)
+    .sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] || null;
 }
 
 /**
@@ -185,7 +205,7 @@ export function buildModelLockUpdate(model, cooldownMs) {
 export function buildClearModelLocksUpdate(connection) {
   const cleared = {};
   for (const key of Object.keys(connection)) {
-    if (key.startsWith(MODEL_LOCK_PREFIX)) cleared[key] = null;
+    if (key.startsWith(MODEL_LOCK_PREFIX) || key.startsWith(MODEL_LOCK_CAUSE_PREFIX)) cleared[key] = null;
   }
   return cleared;
 }

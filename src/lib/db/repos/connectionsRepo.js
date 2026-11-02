@@ -27,7 +27,7 @@ function resetHealthStateOnActivation(existing, patch) {
   };
 
   for (const key of Object.keys(existing || {})) {
-    if (key.startsWith(MODEL_LOCK_PREFIX)) normalized[key] = null;
+    if (key.startsWith(MODEL_LOCK_PREFIX) || key.startsWith("modelLockCause_")) normalized[key] = null;
   }
 
   return normalized;
