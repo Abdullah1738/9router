@@ -32,6 +32,47 @@ const CODEX_SSE_USER_OUTPUT_PATTERNS = [
 ];
 const CODEX_SSE_PEEK_BYTES = 256 * 1024;
 const CODEX_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different model.";
+
+// The compact endpoint can return either JSON or SSE without a Content-Type.
+// Read only enough of the first field to identify SSE, then replay every byte.
+async function classifyHeaderlessCompactResponse(response) {
+  if (!response.ok || !response.body || response.headers.get("content-type")) return response;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks = [];
+  const ssePrefixes = ["event:", "data:", "id:", "retry:", ":"];
+  let text = "";
+  let bytes = 0;
+  let isSse = false;
+  while (bytes < 4096) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    bytes += value.byteLength;
+    text += decoder.decode(value, { stream: true });
+    const prefix = text.trimStart();
+    if (!prefix) continue;
+    if (ssePrefixes.some(field => prefix.startsWith(field))) { isSse = true; break; }
+    if (!ssePrefixes.some(field => field.startsWith(prefix))) break;
+  }
+  const headers = new Headers(response.headers);
+  if (isSse) headers.set("content-type", "text/event-stream");
+  const body = new ReadableStream({
+    start(controller) { for (const chunk of chunks) controller.enqueue(chunk); },
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) { reader.releaseLock(); controller.close(); }
+        else controller.enqueue(value);
+      } catch (error) { reader.releaseLock(); controller.error(error); }
+    },
+    async cancel(reason) {
+      try { await reader.cancel(reason); } finally { reader.releaseLock(); }
+    },
+  });
+  return new Response(body, { status: response.status, statusText: response.statusText, headers });
+}
+
 function isCodexResponsesLiteModel(model) {
   const baseId = String(model || "").replace(/\([^()]+\)\s*$/, "");
   return getProviderModels("cx").some((entry) => entry.id === baseId && entry.responsesLite === true);
@@ -342,6 +383,7 @@ export class CodexExecutor extends BaseExecutor {
     let attempt = 0;
     while (true) {
       const result = await super.execute(args);
+      if (args.requestContext?.compact) result.response = await classifyHeaderlessCompactResponse(result.response);
       // Compact JSON is opaque data, not an SSE error envelope to scan or retry.
       if (args.requestContext?.compact && !(result.response.headers.get("content-type") || "").toLowerCase().includes("text/event-stream")) return result;
       const peek = await this._peekSseTransientError(result.response);

@@ -39,6 +39,16 @@ function sse(events) {
   return new Response(text, { headers: { "content-type": "text/event-stream" } });
 }
 
+function headerlessChunks(chunks) {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    },
+  }));
+}
+
 afterEach(() => vi.restoreAllMocks());
 beforeEach(() => vi.clearAllMocks());
 
@@ -131,6 +141,36 @@ describe("Codex legacy compact endpoint", () => {
     const result = await handleChatCore(coreOptions({ stream: true }, { accept: "text/event-stream" }));
     expect(result.response.headers.get("content-type")).toContain("application/json");
     expect(await result.response.json()).toEqual(completed);
+  });
+
+  it("recognizes headerless SSE across chunks and converts it to JSON", async () => {
+    const completed = { id: "resp_headerless", model, output: [{ type: "compaction", encrypted_content: "enc" }], usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 } };
+    const fetch = vi.spyOn(proxyFetch, "proxyAwareFetch").mockResolvedValue(headerlessChunks([
+      " \n", "ev", "ent: response.completed\ndata: ", JSON.stringify({ response: completed }), "\n\n",
+    ]));
+    const result = await handleChatCore(coreOptions({ stream: false }));
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(result.response.headers.get("content-type")).toContain("application/json");
+    expect(await result.response.json()).toEqual(completed);
+  });
+
+  it("still retries transient errors from headerless SSE", async () => {
+    const fetch = vi.spyOn(proxyFetch, "proxyAwareFetch")
+      .mockResolvedValueOnce(headerlessChunks(["event: error\ndata: ", JSON.stringify({ message: "server_is_overloaded" }), "\n\n"]))
+      .mockResolvedValueOnce(jsonResponse({ output: [] }));
+    const executor = new CodexExecutor();
+    executor.config = { ...executor.config, retry: { ...executor.config.retry, 503: { attempts: 1, delayMs: 1 } } };
+    await executor.execute(args(true));
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual(Array(2).fill("https://chatgpt.com/backend-api/codex/responses/compact"));
+  });
+
+  it("passes headerless JSON through byte-for-byte without an SSE error retry", async () => {
+    const raw = '  {"output":[{"type":"compaction","encrypted_content":"server_is_overloaded"}]}\n';
+    const fetch = vi.spyOn(proxyFetch, "proxyAwareFetch").mockResolvedValue(headerlessChunks(["  {", raw.slice(3)]));
+    const result = await handleChatCore(coreOptions({ stream: false }));
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(result.response.headers.get("content-type")).toContain("application/json");
+    expect(await result.response.text()).toBe(raw);
   });
 
   it("returns the exact compact JSON bytes without treating JSON text as an SSE error", async () => {
