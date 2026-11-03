@@ -287,9 +287,9 @@ export class CodexExecutor extends BaseExecutor {
     return headers;
   }
 
-  buildUrl(model, stream, urlIndex = 0, credentials = null) {
+  buildUrl(model, stream, urlIndex = 0, credentials = null, requestContext = {}) {
     const base = super.buildUrl(model, stream, urlIndex, credentials);
-    return this._isCompact ? `${base}/compact` : base;
+    return requestContext?.compact ? `${base}/compact` : base;
   }
 
   async refreshCredentials(credentials, log) {
@@ -342,6 +342,8 @@ export class CodexExecutor extends BaseExecutor {
     let attempt = 0;
     while (true) {
       const result = await super.execute(args);
+      // Compact JSON is opaque data, not an SSE error envelope to scan or retry.
+      if (args.requestContext?.compact && !(result.response.headers.get("content-type") || "").toLowerCase().includes("text/event-stream")) return result;
       const peek = await this._peekSseTransientError(result.response);
       if (!peek.matched) {
         // Replace body with re-assembled stream (prefix bytes already read + rest)
@@ -458,10 +460,8 @@ export class CodexExecutor extends BaseExecutor {
    * Transform request before sending - inject default instructions if missing.
    * Image fetching is handled separately in prefetchImages() so this stays sync.
    */
-  transformRequest(model, body, stream, credentials) {
+  transformRequest(model, body, stream, credentials, requestContext = {}) {
     const nativeCodex = isNativePassthrough(detectClientTool(credentials?.rawHeaders || {}, body), "codex");
-    this._isCompact = !!body._compact;
-    delete body._compact;
     // Resolve conversation-stable session_id (priority: body → assistant-text → workspace → machine)
     this._currentSessionId = resolveCacheSessionId(body, credentials);
     // Convert string input to array format (Codex API requires input as array)
@@ -513,8 +513,13 @@ export class CodexExecutor extends BaseExecutor {
     // Flatten function tools + drop unsupported types
     normalizeCodexTools(body, nativeCodex);
 
-    // Ensure streaming is enabled (Codex API requires it)
-    body.stream = true;
+    // The compact endpoint returns JSON; regular Codex Responses require streaming.
+    if (requestContext?.compact) {
+      delete body.stream;
+      delete body.stream_options;
+    } else {
+      body.stream = true;
+    }
 
     // If no instructions provided, inject default Codex instructions
     if (!responsesLite && !convertedLitePrefix && (!body.instructions || body.instructions.trim() === "")) {

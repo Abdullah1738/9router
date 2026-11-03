@@ -29,6 +29,9 @@ function processSSEMessage(msg, state) {
     state.items.set(parsed.output_index ?? 0, parsed.item);
   } else if (eventType === "response.completed" || eventType === "response.done") {
     state.status = "completed";
+    if (parsed.response && typeof parsed.response === "object" && !Array.isArray(parsed.response)) {
+      state.completedResponse = parsed.response;
+    }
     if (parsed.response?.usage) {
       state.usage.input_tokens = parsed.response.usage.input_tokens || 0;
       state.usage.output_tokens = parsed.response.usage.output_tokens || 0;
@@ -90,6 +93,14 @@ export async function convertResponsesStreamToJson(stream) {
   const maxIndex = state.items.size > 0 ? Math.max(...state.items.keys()) : -1;
   for (let i = 0; i <= maxIndex; i++) {
     output.push(state.items.get(i) || { type: "message", content: [], role: "assistant" });
+  }
+
+  if (state.completedResponse) {
+    const completedOutput = state.completedResponse.output;
+    return {
+      ...state.completedResponse,
+      output: Array.isArray(completedOutput) && completedOutput.length > 0 ? completedOutput : output,
+    };
   }
 
   return {

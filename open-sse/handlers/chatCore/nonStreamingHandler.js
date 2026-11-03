@@ -231,6 +231,51 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
   return responseBody;
 }
 
+/** Return compact JSON unchanged; translation and usage buffering would corrupt opaque items. */
+export async function handleCompactJsonResponse({ providerResponse, provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, trackDone, appendLog, pxpipe, reqTag, log }) {
+  trackDone();
+  // Read a clone for accounting so the returned bytes remain untouched.
+  let responseBody = null;
+  try { responseBody = await providerResponse.clone().json(); } catch { /* preserve non-JSON upstream bodies too */ }
+  reqLogger.logProviderResponse(providerResponse.status, providerResponse.statusText, providerResponse.headers, responseBody);
+  if (onRequestSuccess) {
+    Promise.resolve().then(onRequestSuccess).catch(err => {
+      console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
+    });
+  }
+  const usage = extractUsageFromResponse(responseBody);
+  appendLog({ tokens: usage, status: `${providerResponse.status} OK` });
+  saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, silent: true });
+  const totalLatency = Date.now() - requestStartTime;
+  if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { total: totalLatency } }));
+  saveRequestDetail(buildRequestDetail({
+    provider, model, connectionId,
+    latency: { ttft: totalLatency, total: totalLatency },
+    tokens: usage || { prompt_tokens: 0, completion_tokens: 0 },
+    request: extractRequestConfig(body, stream),
+    providerRequest: finalBody || translatedBody || null,
+    providerResponse: responseBody,
+    response: { finish_reason: responseBody?.status || "unknown" },
+    pxpipe,
+    status: "success",
+  }, { endpoint: clientRawRequest?.endpoint || null })).catch(err => {
+    console.error("[RequestDetail] Failed to save:", err.message);
+  });
+
+  return {
+    success: true,
+    response: new Response(providerResponse.body, {
+      status: providerResponse.status,
+      statusText: providerResponse.statusText,
+      headers: {
+        "Content-Type": providerResponse.headers.get("content-type") || "application/json",
+        "Access-Control-Allow-Origin": "*",
+        ...upstreamResponseHeaders(providerResponse.headers),
+      },
+    }),
+  };
+}
+
 /**
  * Handle non-streaming response from provider.
  */
