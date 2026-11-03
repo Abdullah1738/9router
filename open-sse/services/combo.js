@@ -349,6 +349,7 @@ export function isZeroContentResponse(data) {
  * @param {boolean} [options.sessionSticky=true] - Keep chosen model across session requests to retain prompt cache
  * @param {number} [options.confidenceThreshold=0.8] - Minimum confidence required for model switch (0-1)
  * @param {Function|null} [options.resolveSmartChoice=null] - Smart router resolver callback: (body, models) => Promise<{ choice, probabilities, confidence } | null>
+ * @param {boolean} [options.peekChatResponses=true] - Inspect chat responses for empty content before accepting them
  * @returns {Promise<Response>}
  */
 export async function handleComboChat({
@@ -365,6 +366,7 @@ export async function handleComboChat({
   sessionSticky = true,
   confidenceThreshold = 0.8,
   resolveSmartChoice = null,
+  peekChatResponses = true,
 }) {
   let rotatedModels = models;
   let activeStickyModel = null;
@@ -480,6 +482,10 @@ export async function handleComboChat({
       // otherwise be delivered as a successful empty answer with no failover.
       // Peek the stream for real content before committing to this candidate.
       if (result.ok) {
+        if (!peekChatResponses) {
+          log.info("COMBO", `Model ${modelStr} succeeded`);
+          return result;
+        }
         let peeked = null;
         try {
           peeked = await peekComboResponse(result, log);

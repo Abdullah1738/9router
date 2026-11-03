@@ -11,6 +11,7 @@ import { getKeyAccessContext, enforceKeyAccess } from "../services/keyAccess.js"
 import { handleImageGenerationCore } from "open-sse/handlers/imageGenerationCore.js";
 import { getImageAdapter } from "open-sse/handlers/imageProviders/index.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
+import { normalizeNativeCodexImageRequest } from "open-sse/utils/codexImageRequest.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { updateProviderCredentials, checkAndRefreshToken, storedTokensIfStale } from "../services/tokenRefresh.js";
 import { handleComboChat } from "open-sse/services/combo.js";
@@ -53,6 +54,9 @@ export async function handleImageGeneration(request) {
   }
 
   const url = new URL(request.url);
+  const normalized = normalizeNativeCodexImageRequest({ endpoint: url.pathname, headers: request.headers, body });
+  if (normalized.error) return errorResponse(normalized.status, normalized.error);
+  body = normalized.body;
   const preferredConnectionId = request.headers.get("x-connection-id") || null;
   const wantsStream = (request.headers.get("accept") || "").includes("text/event-stream");
   const binaryOutput = url.searchParams.get("response_format") === "binary";
@@ -88,6 +92,8 @@ export async function handleImageGeneration(request) {
       comboName: modelStr,
       comboStrategy,
       comboStickyLimit,
+      // Image SSE events and JSON data are not chat content; peeking would discard them.
+      peekChatResponses: false,
     });
   }
 
@@ -99,6 +105,11 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
   if (!modelInfo.provider) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
 
   const { provider, model } = modelInfo;
+
+  // An adapter that ignores references would silently turn an edit into a generation.
+  if (endpoint?.endsWith("/images/edits") && provider !== "codex") {
+    return errorResponse(HTTP_STATUS.BAD_REQUEST, `Provider '${provider}' does not support image edits`);
+  }
 
   // noAuth providers — no credential needed
   if (NO_AUTH_PROVIDERS.has(provider)) {
