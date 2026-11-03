@@ -230,7 +230,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     if (clientTool === "claude") {
       // Anthropic rejects top-level reasoning_effort on native passthrough (400); effort lives in output_config.
       delete translatedBody.reasoning_effort;
-      normalizeClaudePassthrough(translatedBody, translatedBody.model);
+      normalizeClaudePassthrough(translatedBody, translatedBody.model, provider);
     }
   } else {
     translatedBody = translateRequest(sourceFormat, targetFormat, upstreamModel, body, stream, credentials, provider, reqLogger, stripList, connectionId, clientTool);

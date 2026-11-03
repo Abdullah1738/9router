@@ -108,9 +108,17 @@ export function extractThinking(body) {
 // OpenAI has no equivalent for, so the intent cannot survive translation on its own.
 export function captureThinking(body) {
   const cfg = extractThinking(body);
-  if (!cfg || cfg.mode === "none") return cfg;
-  const display = openAIThinkingDisplay(body);
-  return display ? { ...cfg, display } : cfg;
+  if (!cfg) return cfg;
+  const display = cfg.mode === "none" ? undefined : openAIThinkingDisplay(body);
+  const claudeDisplay = typeof body.thinking?.display === "string" ? body.thinking.display : undefined;
+  const hasBlockBinding = (body.thinking?.type === "adaptive" || body.thinking?.type === "enabled")
+    && Object.hasOwn(body.thinking, "block_binding");
+  return {
+    ...cfg,
+    ...(display ? { display } : {}),
+    ...(claudeDisplay ? { claudeDisplay } : {}),
+    ...(hasBlockBinding ? { blockBinding: body.thinking.block_binding } : {}),
+  };
 }
 
 function openAIThinkingDisplay(body) {
@@ -455,8 +463,25 @@ export function applyThinking(targetFormat, model, body, provider = null, intent
   // Anthropic's `display` (summarized | omitted) decides whether thinking text
   // comes back at all; keep what the client asked for instead of resetting it.
   // An OpenAI-shaped client's ask arrives via the captured intent instead.
-  const display = typeof body.thinking?.display === "string" ? body.thinking.display : intent?.display;
+  const display = typeof body.thinking?.display === "string" ? body.thinking.display
+    : (provider === "claude" ? intent?.claudeDisplay : undefined) ?? intent?.display;
+  // Unlike format conversion, direct callers have no pre-captured client intent.
+  const hasBlockBinding = intent !== undefined
+    ? Object.hasOwn(intent ?? {}, "blockBinding")
+    : (body.thinking?.type === "adaptive" || body.thinking?.type === "enabled")
+      && Object.hasOwn(body.thinking, "block_binding");
+  const blockBinding = intent !== undefined ? intent?.blockBinding : body.thinking?.block_binding;
   stripAll(body);
   applyFormat(fmt, body, cfg, caps, supportedLevels, display, cleanModel);
+  // Always-on Claude models normally omit the switch, but a client-supplied
+  // binding needs an adaptive object even when display defaults to omitted.
+  if (hasBlockBinding && provider === "claude" && /claude/i.test(cleanModel)
+      && fmt === "claude-adaptive" && cfg.mode !== "none" && !body.thinking) {
+    body.thinking = { type: "adaptive" };
+  }
+  if (hasBlockBinding && provider === "claude" && /claude/i.test(cleanModel) && (fmt === "claude-adaptive" || fmt === "claude-budget")
+      && (body.thinking?.type === "adaptive" || body.thinking?.type === "enabled")) {
+    body.thinking.block_binding = blockBinding;
+  }
   return body;
 }

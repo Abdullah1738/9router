@@ -39,20 +39,28 @@ function readVarint(bytes, offset) {
   return null;
 }
 
-export function isValidClaudeSignature(rawSignature) {
+export function isValidClaudeSignature(rawSignature, { requireCompleteLegacy = false } = {}) {
   const sig = stripCachePrefix(rawSignature);
   if (!sig || sig.length > MAX_CLAUDE_SIGNATURE_LEN || sig === DEFAULT_THINKING_CLAUDE_SIGNATURE) return false;
 
   try {
     const decoded = decodeBase64(sig);
     if (!decoded?.length) return false;
+    const validLegacy = bytes => {
+      if (bytes[0] !== CLAUDE_SIGNATURE_MARKER) return false;
+      if (!requireCompleteLegacy) return true;
+      const length = readVarint(bytes, 1);
+      return !!length && length.value > 0n && length.value <= BigInt(bytes.length - length.next);
+    };
     if (sig[0] === "E") {
-      return decoded[0] === CLAUDE_SIGNATURE_MARKER;
+      return validLegacy(decoded);
     }
     if (sig[0] === "R") {
       if (decoded[0] !== 0x45) return false; // 'E'
-      const inner = decodeBase64(decoded.toString());
-      return !!inner?.length && inner[0] === CLAUDE_SIGNATURE_MARKER;
+      const innerText = decoded.toString();
+      if (requireCompleteLegacy && innerText.replace(/=+$/, "") === DEFAULT_THINKING_CLAUDE_SIGNATURE.replace(/=+$/, "")) return false;
+      const inner = decodeBase64(innerText);
+      return !!inner?.length && validLegacy(inner);
     }
     if (decoded[0] !== 0x08) return false;
     const version = readVarint(decoded, 1);

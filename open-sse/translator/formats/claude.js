@@ -39,10 +39,11 @@ const CONTENTFUL_BLOCKS = new Set([
   CLAUDE_BLOCK.CONTAINER_UPLOAD,
 ]);
 
-function isContentfulBlock(block) {
+function isContentfulBlock(block, allowOmittedThinking = false) {
   if (!block) return false;
   if (block.type === CLAUDE_BLOCK.TEXT) return !!block.text?.trim();
-  if (block.type === CLAUDE_BLOCK.THINKING) return !!String(block.thinking ?? "").trim();
+  if (block.type === CLAUDE_BLOCK.THINKING) return !!String(block.thinking ?? "").trim()
+    || (allowOmittedThinking && isValidClaudeThinkingBlock(block, true));
   if (block.type === CLAUDE_BLOCK.REDACTED_THINKING) return typeof block.data === "string" && block.data.length > 0;
   return CONTENTFUL_BLOCKS.has(block.type);
 }
@@ -51,9 +52,11 @@ function isThinkingBlock(block) {
   return block?.type === CLAUDE_BLOCK.THINKING || block?.type === CLAUDE_BLOCK.REDACTED_THINKING;
 }
 
-function isValidClaudeThinkingBlock(block) {
+function isValidClaudeThinkingBlock(block, allowOmittedThinking = false) {
   if (block.type === CLAUDE_BLOCK.THINKING) {
-    return !!String(block.thinking ?? "").trim() && isValidClaudeSignature(block.signature);
+    if (String(block.thinking ?? "").trim()) return isValidClaudeSignature(block.signature);
+    return allowOmittedThinking && typeof block.thinking === "string"
+      && isValidClaudeSignature(block.signature, { requireCompleteLegacy: true });
   }
   // RedactedThinkingBlockParam carries opaque `data`, not a `signature`.
   // Only Anthropic can authenticate it; don't rewrite or interpret the data.
@@ -61,13 +64,13 @@ function isValidClaudeThinkingBlock(block) {
     && (block.signature === undefined || isValidClaudeSignature(block.signature));
 }
 
-export function hasValidContent(msg) {
+export function hasValidContent(msg, allowOmittedThinking = false) {
   if (typeof msg.content === "string" && msg.content.trim()) return true;
   if (msg.content && typeof msg.content === "object" && !Array.isArray(msg.content)) {
-    return isContentfulBlock(msg.content);
+    return isContentfulBlock(msg.content, allowOmittedThinking);
   }
   if (Array.isArray(msg.content)) {
-    return msg.content.some(isContentfulBlock);
+    return msg.content.some(block => isContentfulBlock(block, allowOmittedThinking));
   }
   return false;
 }
@@ -233,12 +236,18 @@ function hasForeignServerToolUseId(block) {
 // 3. bare content-block objects (content: {block} instead of [{block}]) → wrapped first
 // 4. role "system" messages (mid-conversation-system beta) → only top-level system is allowed
 // 5. server_tool_use blocks carrying a foreign (non-srvtoolu_) id → rejected outright
-export function normalizeClaudePassthrough(body, model = "") {
+export function normalizeClaudePassthrough(body, model = "", provider = "claude") {
   if (!body || typeof body !== "object") return body;
 
   // 1. Downgrade adaptive thinking for models that don't support it
   if (body.thinking?.type === "adaptive" && isAdaptiveThinkingUnsupported(model)) {
-    body.thinking = { type: "enabled", budget_tokens: 10000 };
+    const blockBinding = provider === "claude" && Object.hasOwn(body.thinking, "block_binding")
+      ? { block_binding: body.thinking.block_binding } : {};
+    body.thinking = { type: "enabled", budget_tokens: 10000, ...blockBinding };
+  }
+  if (provider === "claude" && body.thinking?.type === "disabled" && Object.hasOwn(body.thinking, "block_binding")) {
+    const { block_binding, ...thinking } = body.thinking;
+    body.thinking = thinking;
   }
 
   // 2. Strip effort param for models that don't support it (keep other output_config fields)
@@ -305,7 +314,7 @@ export function normalizeClaudePassthrough(body, model = "") {
       for (const block of msg.content) {
         if (block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING) {
           hadThinking = true;
-          if (isValidClaudeThinkingBlock(block)) {
+          if (isValidClaudeThinkingBlock(block, provider === "claude")) {
             hasKeptThinking = true;
             kept.push(block);
           }
@@ -344,16 +353,15 @@ export function normalizeClaudePassthrough(body, model = "") {
   // Anthropic rejects `messages.N.content` blocks with empty text (400
   // "text content blocks must be non-empty"); a message whose blocks were all
   // stripped above must be dropped, not padded with an empty placeholder.
-  // The same applies to thinking blocks: Anthropic rejects a block with no visible
-  // text (400 "each thinking block must contain non-whitespace thinking"), and such
-  // a block rides along in the client's replayed history on every later turn.
+  // Only Anthropic's signed omitted-thinking blocks can have empty text.
   if (Array.isArray(body.messages)) {
     body.messages = body.messages.filter(msg => {
       if (typeof msg.content === "string") return msg.content.trim().length > 0;
       if (!Array.isArray(msg.content)) return true;
       msg.content = msg.content.filter(block =>
         !(block?.type === CLAUDE_BLOCK.TEXT && !String(block.text ?? "").trim())
-        && !(block?.type === CLAUDE_BLOCK.THINKING && !String(block.thinking ?? "").trim()));
+        && !(block?.type === CLAUDE_BLOCK.THINKING && !String(block.thinking ?? "").trim()
+          && !(provider === "claude" && msg.role === ROLE.ASSISTANT && isValidClaudeThinkingBlock(block, true))));
       return msg.content.length > 0;
     });
     body.messages = ensureTrailingUserTurn(body.messages, originalLastRole);
@@ -587,6 +595,9 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
 
       // Remove cache_control from content blocks
       if (Array.isArray(msg.content)) {
+        if (provider === "claude" && msg.role !== ROLE.ASSISTANT) {
+          msg.content = msg.content.filter(block => !(block?.type === CLAUDE_BLOCK.THINKING && !String(block.thinking ?? "").trim()));
+        }
         for (const block of msg.content) {
           if (!isThinkingBlock(block)) delete block.cache_control;
         }
@@ -594,7 +605,7 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
 
       // Keep final assistant even if empty, otherwise check valid content
       const isFinalAssistant = i === len - 1 && msg.role === "assistant";
-      if (isFinalAssistant || hasValidContent(msg)) {
+      if (isFinalAssistant || hasValidContent(msg, provider === "claude" && msg.role === ROLE.ASSISTANT)) {
         filtered.push(msg);
       }
     }
@@ -648,18 +659,17 @@ export function prepareClaudeRequest(body, provider = null, apiKey = null, conne
           // anthropic-compatible: replace with default (safe fallback for lenient upstreams).
           // DeepSeek (official + opencode-go models): keep existing thinking as-is;
           // add an unsigned placeholder only if missing.
-          // Every branch: a block with no visible thinking text goes — the upstream
-          // Messages API rejects it outright (400 "each thinking block must contain
-          // non-whitespace thinking"), and a valid signature does not save it.
+          // Only Claude's signed omitted-thinking blocks may have no visible text.
           const isClaudeNative = provider === "claude";
           const kept = [];
           for (const block of msg.content) {
             const isThinking = block.type === CLAUDE_BLOCK.THINKING || block.type === CLAUDE_BLOCK.REDACTED_THINKING;
             if (isThinking) {
               hadThinking = true;
-              if (block.type === CLAUDE_BLOCK.THINKING && !String(block.thinking ?? "").trim()) continue;
+              if (block.type === CLAUDE_BLOCK.THINKING && !String(block.thinking ?? "").trim()
+                  && !(isClaudeNative && isValidClaudeThinkingBlock(block, true))) continue;
               if (isClaudeNative) {
-                if (isValidClaudeThinkingBlock(block)) {
+                if (isValidClaudeThinkingBlock(block, true)) {
                   hasKeptThinking = true;
                   kept.push(block);
                 }

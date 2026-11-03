@@ -75,6 +75,13 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   // Strip explicit content types (opt-in via strip[] in PROVIDER_MODELS entry)
   stripContentTypes(result, stripList);
 
+  // OpenAI tool results become user turns on Claude. Capture their binding
+  // before generic prefill cleanup removes thinking from a non-user last turn.
+  const toolTurnThinkingIntent = sourceFormat === FORMATS.OPENAI && targetFormat === FORMATS.CLAUDE
+    && provider === "claude" && result.messages?.[result.messages.length - 1]?.role === ROLE.TOOL
+    && (result.thinking?.type === "adaptive" || result.thinking?.type === "enabled")
+    && Object.hasOwn(result.thinking, "block_binding") ? captureThinking(result) : null;
+
   // Normalize thinking config: remove if lastMessage is not user
   normalizeThinkingConfig(result);
 
@@ -91,7 +98,7 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
 
   // Capture thinking intent from the original (pre-translation) body, before any
   // format conversion strips/renames the fields. Applied after translation.
-  const thinkingIntent = captureThinking(result);
+  const thinkingIntent = toolTurnThinkingIntent || captureThinking(result);
 
   // Capture session id from the original body (envelope still intact, e.g. antigravity request.sessionId)
   const clientSessionId = captureSessionId(result, credentials, connectionId, targetFormat);

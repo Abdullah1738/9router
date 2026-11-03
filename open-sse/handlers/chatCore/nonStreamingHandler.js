@@ -1,5 +1,5 @@
 import { FORMATS } from "../../translator/formats.js";
-import { observeClaudeTransformations } from "../../utils/claudeThinkingLog.js";
+import { observeClaudeSSETransformations, observeClaudeTransformations } from "../../utils/claudeThinkingLog.js";
 import { needsTranslation } from "../../translator/index.js";
 import { openAICompletionToClaudeMessage } from "../../translator/concerns/claudeMessage.js";
 import { ollamaBodyToOpenAI } from "../../translator/response/ollama-to-openai.js";
@@ -241,6 +241,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
 
   if (contentType.includes("text/event-stream")) {
     const sseText = await providerResponse.text();
+    if (observeClaudeThinking) observeClaudeSSETransformations(sseText, log, reqTag);
     const parsed = parseSSEToOpenAIResponse(sseText, model);
     if (!parsed) {
       appendLog({ status: `FAILED ${HTTP_STATUS.BAD_GATEWAY}` });

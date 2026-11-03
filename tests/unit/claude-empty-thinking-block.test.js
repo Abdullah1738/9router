@@ -1,111 +1,78 @@
-// A replayed assistant turn can carry a thinking block whose text is empty or
-// whitespace-only while its signature is still valid — e.g. a thought that was
-// stripped upstream, or a provider that streamed whitespace as reasoning. Both
-// request paths that forward Claude history kept such blocks, and Anthropic
-// rejects the whole request:
-//   400 messages.N.content.0.thinking: each thinking block must contain non-whitespace thinking
-//   - normalizeClaudePassthrough (native Claude passthrough clients) — signature check alone
-//   - prepareClaudeRequest (translated clients; the deepSeekServed and
-//     anthropic-compatible branches keep thinking unconditionally)
-// Empty *text* blocks are already dropped for the same class of upstream 400;
-// thinking blocks need the same treatment on both paths.
-//
-// The signature must be real: an invalid signature is dropped earlier
-// by the signature check, which would mask the text check under test.
+import "../translator/registerAll.js";
 import { describe, it, expect } from "vitest";
+import { DEFAULT_THINKING_CLAUDE_SIGNATURE } from "../../open-sse/config/defaultThinkingSignature.js";
 import { normalizeClaudePassthrough, prepareClaudeRequest } from "../../open-sse/translator/formats/claude.js";
+import { translateRequest } from "../../open-sse/translator/index.js";
+import { FORMATS } from "../../open-sse/translator/formats.js";
 import signatures from "../fixtures/claude-thinking-signatures.json";
 
-const assistant = (blocks) => ({ role: "assistant", content: blocks });
-const thinking = (text) => ({ type: "thinking", thinking: text, signature: signatures[0] });
-
-const claudeRequest = (messages) => ({
-  model: "deepseek-v4.1-flash",
-  max_tokens: 1024,
-  messages,
+const block = (text, signature = signatures[0]) => ({ type: "thinking", thinking: text, signature });
+const request = (thinkingBlock, withTool = false) => ({
+  model: "claude-opus-5-5", max_tokens: 4096,
+  thinking: { type: "enabled", budget_tokens: 1024 },
+  messages: [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: [thinkingBlock, ...(withTool ? [{ type: "tool_use", id: "toolu_1", name: "f", input: {} }] : [])] },
+    { role: "user", content: withTool ? [{ type: "tool_result", tool_use_id: "toolu_1", content: "ok" }] : "next" },
+  ],
 });
+const thinkingBlocks = body => body.messages.flatMap(m => Array.isArray(m.content) ? m.content : []).filter(b => b.type === "thinking");
 
-describe("normalizeClaudePassthrough — blank thinking blocks", () => {
-  it("drops an empty thinking block and keeps its sibling text block", () => {
-    const out = normalizeClaudePassthrough({
-      messages: [
-        { role: "user", content: "hi" },
-        assistant([thinking(""), { type: "text", text: "kept" }]),
-      ],
+describe("Claude omitted thinking", () => {
+  const paths = [
+    ["native passthrough", body => normalizeClaudePassthrough(body, body.model, "claude")],
+    ["Claude translator", body => translateRequest(FORMATS.CLAUDE, FORMATS.CLAUDE, body.model, body, true, null, "claude")],
+    ["OpenAI translator", body => translateRequest(FORMATS.OPENAI, FORMATS.CLAUDE, body.model, body, true, null, "claude")],
+  ];
+  for (const [name, run] of paths) {
+    it.each(["", "  \n\t "])(`${name} keeps fixture-signed %j thinking unchanged, without a placeholder`, (text) => {
+      const input = block(text);
+      const expected = structuredClone(input);
+      const output = run(request(input, true));
+      expect(thinkingBlocks(output)).toEqual([expected]);
     });
 
-    expect(out.messages[1].content).toEqual([{ type: "text", text: "kept" }]);
-  });
-
-  it("drops a whitespace-only thinking block", () => {
-    const out = normalizeClaudePassthrough({
-      messages: [
-        { role: "user", content: "hi" },
-        assistant([thinking("  \n\t "), { type: "text", text: "kept" }]),
-      ],
+    it(`${name} retains a signed thinking-only assistant turn`, () => {
+      const input = block("");
+      const output = run(request(input));
+      expect(output.messages[1].role).toBe("assistant");
+      expect(thinkingBlocks(output)).toEqual([input]);
     });
 
-    expect(out.messages[1].content).toEqual([{ type: "text", text: "kept" }]);
-  });
-
-  it("drops the whole message when the blank thinking block was its only content", () => {
-    const out = normalizeClaudePassthrough({
-      messages: [
-        { role: "user", content: "hi" },
-        assistant([thinking("   ")]),
-      ],
+    it.each([
+      ["unsigned", { type: "thinking", thinking: "" }],
+      ["placeholder", block("", DEFAULT_THINKING_CLAUDE_SIGNATURE)],
+      ["wrapped placeholder", block("", Buffer.from(DEFAULT_THINKING_CLAUDE_SIGNATURE).toString("base64"))],
+      ["wrapped unpadded placeholder", block("", Buffer.from(DEFAULT_THINKING_CLAUDE_SIGNATURE.replace(/=+$/, "")).toString("base64"))],
+      ["foreign", block("", "foreign-signature")],
+      ["truncated legacy", block("", "Eg==")],
+      ["truncated wrapped legacy", block("", Buffer.from("Eg==").toString("base64"))],
+      ["incomplete legacy payload", block("", Buffer.from([0x12, 0x03, 0x41]).toString("base64"))],
+    ])(`${name} drops an %s empty block`, (_kind, input) => {
+      const body = request(input);
+      body.messages[1].content.push({ type: "text", text: "kept" });
+      expect(thinkingBlocks(run(body))).toEqual([]);
     });
+  }
 
-    expect(out.messages.some(m => m.role === "assistant")).toBe(false);
+  it.each(["deepseek", "opencode-go", "anthropic-compatible-custom"])("still drops signed empty blocks on %s", provider => {
+    const body = request(block(""));
+    if (provider === "opencode-go" || provider === "deepseek") body.model = "deepseek-v4.1-flash";
+    body.messages[1].content.push({ type: "text", text: "kept" });
+    expect(thinkingBlocks(prepareClaudeRequest(body, provider))).toEqual([]);
   });
 
-  it("keeps a thinking block that has visible text", () => {
-    const block = thinking("considered it");
-    const out = normalizeClaudePassthrough({
-      messages: [{ role: "user", content: "hi" }, assistant([block, { type: "text", text: "kept" }])],
-    });
-
-    expect(out.messages[1].content).toEqual([block, { type: "text", text: "kept" }]);
-  });
-});
-
-// The translated path (CC → non-native provider over the Claude transport):
-// prepareClaudeRequest's deepSeekServed branch keeps thinking unconditionally, so
-// a blank block rode through to the upstream and 400'd the request.
-describe("prepareClaudeRequest — blank thinking blocks (deepSeekServed via opencode-go)", () => {
-  // prepareClaudeRequest also stamps cache_control on the last non-thinking block
-  // of the final assistant, so assert on block kinds + thinking text, not deep equality.
-  it("drops a blank thinking block but keeps its sibling text block", () => {
-    const out = prepareClaudeRequest(claudeRequest([
-      { role: "user", content: "hi" },
-      assistant([thinking("   "), { type: "text", text: "kept" }]),
-    ]), "opencode-go");
-
-    const asst = out.messages.find(m => m.role === "assistant");
-    expect(asst.content.map(b => b.type)).toEqual(["text"]);
-    expect(asst.content[0].text).toBe("kept");
+  it("does not retain omitted thinking in native compatible-provider passthrough", () => {
+    const body = request(block(""));
+    body.messages[1].content.push({ type: "text", text: "kept" });
+    expect(thinkingBlocks(normalizeClaudePassthrough(body, body.model, "anthropic-compatible-custom"))).toEqual([]);
   });
 
-  it("keeps a signed thinking block that has visible text (deepSeekServed keeps thinking)", () => {
-    const block = thinking("considered it");
-    const out = prepareClaudeRequest(claudeRequest([
-      { role: "user", content: "hi" },
-      assistant([block, { type: "text", text: "kept" }]),
-    ]), "opencode-go");
-
-    const asst = out.messages.find(m => m.role === "assistant");
-    expect(asst.content.some(b => b.type === "thinking" && b.thinking === "considered it")).toBe(true);
-    expect(asst.content.some(b => b.type === "text")).toBe(true);
-  });
-
-  it("drops a blank thinking block on the plain deepseek provider too", () => {
-    const out = prepareClaudeRequest(claudeRequest([
-      { role: "user", content: "hi" },
-      assistant([thinking(""), { type: "text", text: "kept" }]),
-    ]), "deepseek");
-
-    const asst = out.messages.find(m => m.role === "assistant");
-    expect(asst.content.map(b => b.type)).toEqual(["text"]);
-    expect(asst.content[0].text).toBe("kept");
+  it.each(paths)("%s drops signed and invalid empty thinking on a user turn", (_name, run) => {
+    const body = request(block(""));
+    body.messages[0].content = [block(""), block("", "bad"), { type: "text", text: "hello" }];
+    body.messages[1].content.push({ type: "text", text: "answer" });
+    const out = run(body);
+    expect(out.messages[0].content).toEqual([{ type: "text", text: "hello" }]);
   });
 });
